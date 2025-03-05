@@ -5,4 +5,5 @@ edition = "2021"
 
 [dependencies]
 rdev = "0.5.3"
+tray-icon = "0.20.0"
 winit = "0.30.9"
