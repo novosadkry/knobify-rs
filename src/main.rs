@@ -1,6 +1,13 @@
 #![windows_subsystem = "windows"]
 
+mod config;
+mod spotify;
+
 use std::thread;
+use futures::executor;
+use dotenv::dotenv;
+use anyhow::{Context, Result};
+use spotify::Spotify;
 use tray_icon::{
     menu::{Menu, MenuItemBuilder},
     TrayIconBuilder,
@@ -21,16 +28,13 @@ enum UserEvent {
 
 #[derive(Default)]
 struct KnobifyApp {
+    spotify: Spotify,
     window: Option<Window>
 }
 
 impl ApplicationHandler<UserEvent> for KnobifyApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window_attributes = Window::default_attributes()
-            .with_title("A fantastic window!")
-            .with_active(false)
-            .with_visible(false);
-
+        let window_attributes = Window::default_attributes().with_visible(false);
         self.window = Some(event_loop.create_window(window_attributes).unwrap());
     }
 
@@ -46,16 +50,26 @@ impl ApplicationHandler<UserEvent> for KnobifyApp {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        let volume_up_key = config::get_volume_up_key();
+        let volume_down_key = config::get_volume_down_key();
+
         match event {
             UserEvent::KeyPressEvent(key) => {
-                match key {
-                    rdev::Key::Alt => { event_loop.exit(); }
-                    _ => {}
+                if let rdev::Key::Unknown(code) = key {
+                    if code == volume_up_key {
+                        executor::block_on(self.spotify.volume_up()).unwrap();
+                    } else if code == volume_down_key {
+                        executor::block_on(self.spotify.volume_down()).unwrap();
+                    }
                 }
             },
             UserEvent::MenuEvent(event) => {
-                if event.id == "exit" {
-                    event_loop.exit();
+                match event.id.0.as_str() {
+                    "exit" => event_loop.exit(),
+                    "login" => {
+                        self.spotify = executor::block_on(Spotify::login()).unwrap();
+                    },
+                    _ => {}
                 }
             },
             UserEvent::TrayIconEvent(TrayIconEvent::DoubleClick { .. }) => {
@@ -67,8 +81,12 @@ impl ApplicationHandler<UserEvent> for KnobifyApp {
     }
 }
 
-fn main() {
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build().unwrap();
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenv().ok();
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()
+        .context("Failed to create event loop!")?;
 
     let proxy = event_loop.create_proxy();
     tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
@@ -81,19 +99,24 @@ fn main() {
     }));
 
     let mut app = KnobifyApp::default();
-
     let tray_menu = Menu::new();
+
+    tray_menu.append(&MenuItemBuilder::new()
+        .text("Login")
+        .id("login".into())
+        .enabled(true)
+        .build())?;
+
     tray_menu.append(&MenuItemBuilder::new()
         .text("Exit")
         .id("exit".into())
         .enabled(true)
-        .build()).unwrap();
+        .build())?;
 
     let _tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_tooltip("Knobify")
-        .build()
-        .unwrap();
+        .build()?;
 
     let proxy = event_loop.create_proxy();
     thread::spawn(move || {
@@ -108,5 +131,7 @@ fn main() {
         }
     });
 
-    event_loop.run_app(&mut app).unwrap();
+    event_loop.run_app(&mut app)?;
+
+    Ok(())
 }
