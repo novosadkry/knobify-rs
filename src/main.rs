@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use spotify::Spotify;
 use tray_icon::{
     menu::{Menu, MenuItemBuilder},
+    Icon,
     TrayIconBuilder,
     TrayIconEvent
 };
@@ -115,6 +116,7 @@ async fn main() -> Result<()> {
 
     let _tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
+        .with_icon(Icon::from_path("icon.ico", Some((512, 512)))?)
         .with_tooltip("Knobify")
         .build()?;
 
