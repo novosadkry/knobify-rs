@@ -1,7 +1,7 @@
 use crate::config;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::{
-    env, net::SocketAddr, sync::Arc
+    env, net::SocketAddr, path::PathBuf, sync::Arc
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -21,58 +21,84 @@ use rspotify::{
 #[derive(Default)]
 pub struct Spotify {
     client: AuthCodeSpotify,
-    volume: u8
+    volume: u8,
+    authenticated: bool
 }
 
 impl Spotify {
+    /// Logs in interactively, opening a browser window if there's no usable
+    /// cached session. Used for the tray "Login" action.
     pub async fn login() -> Result<Spotify> {
-        let client = oauth_client().await?;
-        let playback = client.current_playback(None, Some([&AdditionalType::Track])).await?;
+        let client = oauth_client(true).await?;
+        Spotify::from_client(client).await
+    }
 
-        let spotify = Spotify {
-            client: oauth_client().await?,
-            volume: playback.map(|playback| playback.device.volume_percent)
-                .flatten().unwrap_or(50) as u8,
-            ..Default::default()
-        };
+    /// Tries to restore a previously logged-in session from the token cache
+    /// without ever opening a browser. Used to restore the session on startup.
+    pub async fn from_cache() -> Result<Spotify> {
+        let client = oauth_client(false).await?;
+        Spotify::from_client(client).await
+    }
 
-        Ok(spotify)
+    async fn from_client(client: AuthCodeSpotify) -> Result<Spotify> {
+        // A failure to fetch the current playback (e.g. no active device, or a
+        // transient network error) shouldn't prevent logging in - just fall
+        // back to a default volume.
+        let volume = client
+            .current_playback(None, Some([&AdditionalType::Track])).await
+            .ok()
+            .flatten()
+            .and_then(|playback| playback.device.volume_percent)
+            .unwrap_or(50) as u8;
+
+        Ok(Spotify { client, volume, authenticated: true })
     }
 
     pub async fn volume_up(&mut self) -> Result<()> {
+        if !self.authenticated {
+            return Ok(());
+        }
+
         let increment = config::get_volume_increment();
-
-        self.volume = {
-            let volume = self.volume + increment;
-            if volume > 100 { 100 }
-            else { volume }
-        };
-
+        self.volume = self.volume.saturating_add(increment).min(100);
         self.client.volume(self.volume, None).await?;
 
         Ok(())
     }
 
     pub async fn volume_down(&mut self) -> Result<()> {
-        let increment: u8 = env::var("VOLUME_INCREMENT")?.parse()?;
+        if !self.authenticated {
+            return Ok(());
+        }
 
-        self.volume = {
-            let volume = self.volume
-                .checked_sub(increment)
-                .unwrap_or(0);
-            if volume > 100 { 100 }
-            else { volume }
-        };
-
+        let increment = config::get_volume_increment();
+        self.volume = self.volume.saturating_sub(increment);
         self.client.volume(self.volume, None).await?;
 
         Ok(())
     }
 }
 
-async fn oauth_client() -> Result<AuthCodeSpotify> {
+/// Returns a stable, writable location for the cached Spotify token that
+/// doesn't depend on the process's current working directory (which can
+/// vary depending on how the tray app was launched, e.g. on startup).
+fn token_cache_path() -> PathBuf {
+    let base = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir);
+
+    let dir = base.join("Knobify");
+    let _ = std::fs::create_dir_all(&dir);
+
+    dir.join("spotify_token_cache.json")
+}
+
+/// Builds an authenticated client. If `interactive` is true and there's no
+/// usable cached session, opens a browser window to log in. Otherwise, only
+/// a valid cached session is used and an error is returned if none exists.
+async fn oauth_client(interactive: bool) -> Result<AuthCodeSpotify> {
     let oauth = OAuth {
-        redirect_uri: String::from("http://localhost:8888/callback"),
+        redirect_uri: String::from("http://127.0.0.1:8888/callback"),
         scopes: scopes!(
             "streaming",
             "playlist-read-collaborative",
@@ -102,21 +128,27 @@ async fn oauth_client() -> Result<AuthCodeSpotify> {
         Config {
             token_cached: true,
             token_refreshing: true,
+            cache_path: token_cache_path(),
             ..Default::default()
         }
     );
 
-    if let Some(token) = spotify.read_token_cache(false).await.ok().flatten() {
-        spotify.token = Arc::new(Mutex::new(Some(token)));
-    }
+    // allow_expired=true: an expired-but-cached token is still useful, since
+    // it carries a refresh token that lets subsequent API calls silently
+    // refresh it (token_refreshing above) instead of forcing a fresh login.
+    match spotify.read_token_cache(true).await.ok().flatten() {
+        Some(token) => {
+            spotify.token = Arc::new(Mutex::new(Some(token)));
+        },
+        None if interactive => {
+            let url = spotify.get_authorize_url(false)?;
+            let code = get_code_from_user(&spotify, url.as_str()).await
+                .context("Couldn't acquire auth code from the user")?;
 
-    else {
-        let url = spotify.get_authorize_url(false)?;
-        let code = get_code_from_user(&spotify, url.as_str()).await
-            .context("Couldn't acquire auth code from the user")?;
-
-        spotify.request_token(code.as_str()).await?;
-        spotify.write_token_cache().await?;
+            spotify.request_token(code.as_str()).await?;
+            spotify.write_token_cache().await?;
+        },
+        None => bail!("No cached Spotify session available"),
     };
 
     Ok(spotify)
