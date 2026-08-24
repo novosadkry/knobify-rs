@@ -10,7 +10,7 @@ use dotenv::{dotenv, from_path};
 use anyhow::{Context, Result};
 use spotify::Spotify;
 use tray_icon::{
-    menu::{Menu, MenuItemBuilder},
+    menu::{Menu, MenuItem, MenuItemBuilder},
     Icon,
     TrayIconBuilder,
     TrayIconEvent
@@ -28,10 +28,22 @@ enum UserEvent {
     KeyPressEvent(u32)
 }
 
+const STATUS_LOGGED_IN: &str = "● Logged in";
+const STATUS_LOGGED_OUT: &str = "○ Not logged in";
+
 #[derive(Default)]
 struct KnobifyApp {
     spotify: Spotify,
-    window: Option<Window>
+    window: Option<Window>,
+    status_item: Option<MenuItem>
+}
+
+impl KnobifyApp {
+    fn set_logged_in(&self, logged_in: bool) {
+        if let Some(status_item) = &self.status_item {
+            status_item.set_text(if logged_in { STATUS_LOGGED_IN } else { STATUS_LOGGED_OUT });
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for KnobifyApp {
@@ -76,7 +88,10 @@ impl ApplicationHandler<UserEvent> for KnobifyApp {
                     "exit" => event_loop.exit(),
                     "login" => {
                         match executor::block_on(Spotify::login()) {
-                            Ok(spotify) => self.spotify = spotify,
+                            Ok(spotify) => {
+                                self.spotify = spotify;
+                                self.set_logged_in(true);
+                            },
                             Err(error) => eprintln!("Error logging into Spotify: {:?}", error),
                         }
                     },
@@ -123,12 +138,27 @@ async fn main() -> Result<()> {
 
     // Silently restore a previously logged-in session, if one is cached, so
     // the user doesn't have to log in again every time the app starts.
-    match Spotify::from_cache().await {
-        Ok(spotify) => app.spotify = spotify,
-        Err(error) => eprintln!("No cached Spotify session restored: {:?}", error),
-    }
+    let logged_in = match Spotify::from_cache().await {
+        Ok(spotify) => {
+            app.spotify = spotify;
+            true
+        },
+        Err(error) => {
+            eprintln!("No cached Spotify session restored: {:?}", error);
+            false
+        },
+    };
 
     let tray_menu = Menu::new();
+
+    let status_item = MenuItemBuilder::new()
+        .text(if logged_in { STATUS_LOGGED_IN } else { STATUS_LOGGED_OUT })
+        .id("status".into())
+        .enabled(false)
+        .build();
+
+    tray_menu.append(&status_item)?;
+    app.status_item = Some(status_item);
 
     tray_menu.append(&MenuItemBuilder::new()
         .text("Login")

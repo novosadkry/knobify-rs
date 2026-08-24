@@ -41,15 +41,10 @@ impl Spotify {
     }
 
     async fn from_client(client: AuthCodeSpotify) -> Result<Spotify> {
-        // A failure to fetch the current playback (e.g. no active device, or a
+        // A failure to fetch the current volume (e.g. no active device, or a
         // transient network error) shouldn't prevent logging in - just fall
         // back to a default volume.
-        let volume = client
-            .current_playback(None, Some([&AdditionalType::Track])).await
-            .ok()
-            .flatten()
-            .and_then(|playback| playback.device.volume_percent)
-            .unwrap_or(50) as u8;
+        let volume = fetch_current_volume(&client).await.unwrap_or(50);
 
         Ok(Spotify { client, volume, authenticated: true })
     }
@@ -77,6 +72,28 @@ impl Spotify {
 
         Ok(())
     }
+}
+
+/// Fetches the actual current volume from Spotify, preferring the active
+/// device's volume (works even when nothing is currently playing) and
+/// falling back to the volume reported by the current playback context.
+async fn fetch_current_volume(client: &AuthCodeSpotify) -> Option<u8> {
+    if let Ok(devices) = client.device().await {
+        let active_volume = devices.iter()
+            .find(|device| device.is_active)
+            .and_then(|device| device.volume_percent);
+
+        if let Some(volume) = active_volume {
+            return Some(volume as u8);
+        }
+    }
+
+    client
+        .current_playback(None, Some([&AdditionalType::Track])).await
+        .ok()
+        .flatten()
+        .and_then(|playback| playback.device.volume_percent)
+        .map(|volume| volume as u8)
 }
 
 /// Returns a stable, writable location for the cached Spotify token that
