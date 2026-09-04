@@ -51,25 +51,23 @@ pub enum TrayAction {
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     Hotkey(HotkeyAction),
-    KeyCaptured {
-        target: BindingTarget,
-        key: KeyCode,
-    },
-    CaptureCancelled,
-    /// The global hook could not be installed in `grab` mode and fell back to
-    /// passive listening; key suppression is unavailable.
+    /// The global keyboard hook could not be installed, so bound keys will not
+    /// work and suppression cannot be offered.
     HookFallback(String),
     Tray(TrayAction),
     Spotify(SpotifyEvent),
 }
 
 /// Resolve a pressed key against the bindings.
+///
+/// Matching goes through the virtual-key code, so a binding written as `KeyA`
+/// and one written as `0x41` are the same key.
 pub fn match_key(bindings: &Bindings, key: &KeyCode) -> Option<HotkeyAction> {
-    if *key == bindings.volume_up {
+    if bindings.volume_up.same_key(key) {
         Some(HotkeyAction::VolumeUp)
-    } else if *key == bindings.volume_down {
+    } else if bindings.volume_down.same_key(key) {
         Some(HotkeyAction::VolumeDown)
-    } else if bindings.mute.as_ref() == Some(key) {
+    } else if bindings.mute.as_ref().is_some_and(|m| m.same_key(key)) {
         Some(HotkeyAction::MuteToggle)
     } else {
         None

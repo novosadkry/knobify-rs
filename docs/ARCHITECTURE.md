@@ -1,7 +1,7 @@
 # Knobify architecture
 
 Knobify is a Windows background utility that turns a keyboard knob (OEM
-virtual-key codes such as 0x81 / 0x82) into Spotify volume control through the
+function keys above F12, such as F13 / F15) into Spotify volume control through the
 Spotify Web API, with an on-screen volume popup (OSD), a settings window and a
 tray icon.
 
@@ -12,33 +12,59 @@ tray icon.
 | `knobify-core` | any host | settings (`config.rs`, `keycode.rs`), `VolumeModel`, `Coalescer`, `AppEvent` vocabulary, the Spotify service (PKCE auth, actor, error mapping) |
 | `knobify` (bin) | Windows only | eframe app (`app.rs`), global key hook (`hotkeys.rs`), OSD (`ui/osd.rs`), settings viewport (`ui/settings.rs`), tray (`ui/tray.rs`), Win32 helpers (`win.rs`) |
 
-`.cargo/config.toml` makes `x86_64-pc-windows-gnu` the default target (the bin
-crate cannot build on Linux: tray-icon needs GTK, rdev needs X11/xdo). Test
-the core on the host with `cargo test -p knobify-core --target x86_64-unknown-linux-gnu`.
+The bin crate is Windows-only (tray-icon needs GTK on Linux, and the keyboard
+hook is Win32), so `cargo build` uses the host target on Windows and needs
+`--target x86_64-pc-windows-gnu` on Linux; see `.cargo/config.toml`. Test the
+core anywhere with `cargo test -p knobify-core`.
 
 ## Threads and channels
 
 ```
-rdev grab thread ─┐                                 ┌─> SpotifyHandle (tokio mpsc) ─> tokio thread: actor (all HTTP, Coalescer)
+hook thread     ─┐                                  ┌─> SpotifyHandle (tokio mpsc) ─> tokio thread: actor (all HTTP, Coalescer)
 tray callbacks  ──┼─> AppHandle { mpsc<AppEvent>, egui::Context } ─> UI thread: App::logic drains, App::ui paints the OSD root
 tokio actor     ──┘      send() = tx.send + repaint_of(ROOT)        └─> Settings = deferred child viewport (Arc<Mutex<SettingsState>>)
 ```
 
 * **UI thread** (eframe/winit main loop). Owns `KnobifyApp`, the tray icon and
   all viewports. Never blocks on I/O.
-* **Hook thread** runs `rdev::grab` forever (rdev has no stop API). The
-  callback executes inside a Windows low-level hook and must return in
-  microseconds: `try_read` the bindings snapshot, match, `AppHandle::send`.
-  Returning `None` swallows the key (only for bound keys when
-  `bindings.suppress` is on, and for the captured key in capture mode).
+* **Hook thread** installs a `WH_KEYBOARD_LL` hook and pumps messages forever
+  (the hook is dispatched only while its thread retrieves messages, and dies
+  with that thread). The callback must return in microseconds: `try_read` the
+  bindings, match on the virtual-key code, queue through `HookSender`.
+  Returning `1` swallows the key - only for a bound key while
+  `bindings.suppress` is on, and for the key a rebind is waiting for.
+  Deliberately **not** a hook library: see the module docs of `hotkeys.rs`.
+* **Hook waker thread** exists only so the callback never has to call egui.
+  `HookSender::send` queues the event and unparks this thread, which then does
+  the `request_repaint_of(ROOT)` that wakes the UI. Anything that can block on
+  a lock the UI thread holds - egui calls, logging - must stay out of the
+  callback, or Windows destroys the hook the first time it overruns 300 ms.
+* The hook is **re-installed every 5 seconds** from a thread timer in that same
+  message loop. Two syscalls, and it turns "the hook died for reasons we did
+  not foresee" from a dead session into at most five seconds of dead keys.
+* **Rebinding does not use the hook at all.** While a rebind is armed,
+  `App::logic` polls `win::poll_pressed_key` (`GetAsyncKeyState`, whose low bit
+  is "pressed since last asked") and takes the first non-modifier key. A rebind
+  that silently does nothing leaves the user unable to fix a wrong binding, so
+  it must not share a failure mode with the thing it exists to configure.
 * **Spotify thread** runs a current-thread tokio runtime hosting the actor,
   which owns the `AuthCodePkceSpotify` client, coalesces volume changes and
   reconciles with `current_playback`.
 
 ## Windowing model (eframe 0.36)
 
+* **Mouse passthrough is not `with_mouse_passthrough`.** winit implements that
+  as `WS_EX_TRANSPARENT | WS_EX_LAYERED`, and a layered window over an OpenGL
+  surface composites unreliably: on real hardware the popup stayed invisible
+  while painting at full opacity, and moving it off-screen and back never
+  brought it back. `apply_osd_exstyles` sets `WS_EX_TRANSPARENT` itself (all
+  click-through needs) and clears `WS_EX_LAYERED`.
+* Idle means the root window is **hidden** (`ViewportCommand::Visible`), not
+  mapped-and-empty and not parked off-screen: an empty pass is a grey rectangle
+  wherever the driver ignores alpha. It stays mapped, parked off-screen, only
+  while Settings is open, since a hidden root cannot host a child viewport.
 * The **root viewport is the OSD**: frameless, transparent, always-on-top,
-  mouse-passthrough, `with_active(false)`, `with_taskbar(false)`, never hidden.
+  click-through, `with_active(false)`, `with_taskbar(false)`.
   `clear_color` is fully transparent; `App::ui` paints the rounded panel only
   while `OsdState::hide_at > now`, otherwise nothing.
   Reason: eframe runs only `update_logic_only` for a hidden root and processes
@@ -120,9 +146,9 @@ redirect_port = 8888
 step = 5                    # 1..=25
 
 [bindings]
-volume_up = "0x82"          # "Name" of an rdev::Key variant, or hex virtual-key code
-volume_down = "0x81"
-# mute = "0xAD"             # rdev 0.5.3 has no media-key variants (see below)
+volume_up = "0x7C"          # hex virtual-key code, or a name like "F13"/"VolumeUp"
+volume_down = "0x7E"        # (0x7C/0x7E are F13/F15, which is what one knob sends)
+# mute = "VolumeMute"
 suppress = false            # swallow bound keys so Windows never sees them
 
 [osd]
@@ -140,9 +166,12 @@ start (`info` by default, `RUST_LOG` still honoured); debug builds also echo to
 stderr. The release binary is linked with `windows_subsystem = "windows"`, so it
 has no console and stderr goes nowhere even when started from a terminal - hence
 the file. One info line each per start records the config path, the log path,
-whether the token cache exists, the loaded settings summary, the hook mode
-(grab/listen) and the first popup placement (work area, source, DPI, result);
-later placements are debug.
+whether the token cache exists, the loaded settings summary, the keyboard hook
+and the first popup placement (work area, source, DPI, result); later placements
+and each bound key press are debug. Note that rspotify's HTTP target is muted to
+`warn` by default because it logs request headers - including the bearer token -
+at info level, so `RUST_LOG=debug` re-enables that; prefer
+`RUST_LOG=knobify=debug`.
 
 ## Verified crate behaviour
 
@@ -158,14 +187,19 @@ Things that are easy to get wrong and were read out of the vendored sources
   starts with `File::open(..)?` - which is the normal first-run state, so
   `restore_session` maps any error to "not logged in" and logs at debug. It
   returns `Ok(None)` for a token whose scopes are a subset mismatch.
-* **`rdev::grab` requires `Fn`** (`listen` takes `FnMut`), so the hook callback
-  cannot own mutable state; the swallowed-release tracking lives in a `Cell`.
-* **rdev 0.5.3 knows no media keys**: `Key` has no `VolumeUp`/`VolumeDown`/
-  `VolumeMute` variants, so those arrive as `Key::Unknown(0xAF/0xAE/0xAD)` and
-  are stored as raw codes. Every named variant's `Debug` output is ASCII
-  alphanumeric (`AltGr`, `IntlBackslash`, `KpReturn`, `Function`, ...), which is
-  exactly what `KeyCode::from_str` accepts; `Unknown(code)` is converted
-  separately, so no name that reaches the config can fail to parse back.
+* **rdev 0.5.3 cannot be used for the hook.** Its `WH_KEYBOARD_LL` callback
+  resolves a printable name for every key press before handing the event on,
+  which calls `AttachThreadInput` against the foreground window's thread and
+  `ToUnicodeEx`. That can block longer than `LowLevelHooksTimeout` (300 ms), and
+  Windows silently removes a hook that overruns it - so the first real keystroke
+  killed the hook, with no error anywhere. Injected keys carry no scan code and
+  skip the slow path, so synthetic tests passed while a keyboard did not. The
+  hook is now installed directly (`hotkeys.rs`), and identifies keys by
+  virtual-key code without any name lookup.
+* **Function keys above F12 are ordinary virtual-key codes**: F13 is `0x7C` and
+  they run to F24 at `0x87`, which is what knobs and macro pads commonly send.
+  `KeyCode` therefore names any code it can (`0x7C` displays as `F13`) and
+  matches names against codes, so `"F13"` and `"0x7C"` are one binding.
 * **winit 0.30 rewrites both style words** (`SetWindowLongW(GWL_STYLE/GWL_EXSTYLE)`)
   in `WindowFlags::apply_diff` whenever any window flag changes, and it never
   sets `WS_EX_TOOLWINDOW`/`WS_EX_NOACTIVATE` itself - see the windowing notes

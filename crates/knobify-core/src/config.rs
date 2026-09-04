@@ -85,8 +85,11 @@ pub struct Bindings {
 impl Default for Bindings {
     fn default() -> Self {
         Self {
-            volume_up: KeyCode::Raw(0x82),
-            volume_down: KeyCode::Raw(0x81),
+            // F13 and F15: what the knob this was written for actually sends.
+            // Function keys above F12 are what knobs and macro pads commonly
+            // emit, since Windows has no other spare keys to give them.
+            volume_up: KeyCode::Raw(0x7C),
+            volume_down: KeyCode::Raw(0x7E),
             mute: None,
             suppress: false,
         }

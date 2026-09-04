@@ -1,3 +1,7 @@
 /target
 *.log
 /.claude/worktrees/
+
+# Leftovers from the pre-rewrite prototype; settings now live in %APPDATA%\knobify
+.env
+.spotify_token_cache.json

@@ -1,32 +1,50 @@
-//! Global keyboard hook (rdev) on a dedicated thread.
+//! The global keyboard hook, on a dedicated thread.
 //!
-//! Contract:
-//! * Always `rdev::grab` (feature `listen-only` swaps in `rdev::listen`).
-//!   Every event decides per key whether to swallow, so "suppress bound keys"
-//!   and capture mode are live toggles without restarting the hook.
-//! * The callback runs inside a low-level Windows hook and must return in
-//!   microseconds: `try_read`/`try_lock` the snapshot, match, `AppHandle::send`, return.
-//! * Capture mode: when `capture` is `Some(target)`, the next `KeyPress` is
-//!   reported as `AppEvent::KeyCaptured` and swallowed (Escape cancels).
-//! * If installing the grab hook fails, fall back to `listen` and report
-//!   `AppEvent::HookFallback`.
+//! # Why this is written defensively
 //!
-//! The decision logic (`decide`) is a pure function of the shared bindings /
-//! capture state and one `rdev::Event`, so it is unit-tested directly without
-//! ever installing a real OS hook.
+//! A `WH_KEYBOARD_LL` callback that overruns `LowLevelHooksTimeout` (300 ms by
+//! default) is removed by Windows silently and permanently: no error, no
+//! further calls, for the rest of the process. This app lost its hook that way
+//! twice - first through rdev, whose callback calls `AttachThreadInput` against
+//! the foreground window's thread before handing the event over, then through
+//! logging and an `egui` repaint request in the callback, both of which can
+//! block on a lock the UI thread holds while it renders.
+//!
+//! So two rules hold here, and the hook is treated as something that can fail
+//! at any time rather than something that stays installed:
+//!
+//! * The callback does nothing but read two locks with `try_*`, compare a
+//!   number, and queue the event through [`HookSender`] (a channel send plus a
+//!   lock-free `unpark`). No logging, no egui, no allocation beyond the queue.
+//! * The hook is re-installed every few seconds. Reinstalling costs two
+//!   syscalls, and it means anything that takes the hook down - including
+//!   causes not yet understood - costs one interval of dead keys instead of the
+//!   whole session.
+//!
+//! Rebinding deliberately does **not** go through here: `win::poll_pressed_key`
+//! asks Windows for the key directly, so capturing a new binding works even
+//! when the hook does not.
+//!
+//! Returning `1` from the callback swallows the key so nothing else on the
+//! system sees it; that happens only for a bound key while `bindings.suppress`
+//! is on, and a swallowed press must have its release swallowed too, or
+//! applications see a key that was never pressed.
 
 use std::cell::Cell;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use knobify_core::events::match_key;
-use knobify_core::{AppEvent, BindingTarget, Bindings, KeyCode};
+use knobify_core::{AppEvent, Bindings, KeyCode};
 
-use crate::handle::AppHandle;
+use crate::handle::{AppHandle, HookSender};
+
+/// How often the hook is torn down and installed again.
+#[cfg(windows)]
+const REARM_INTERVAL_MS: u32 = 5_000;
 
 #[derive(Debug, Default)]
 pub struct HotkeyShared {
     pub bindings: RwLock<Bindings>,
-    pub capture: Mutex<Option<BindingTarget>>,
 }
 
 /// UI-side controller for the hook thread.
@@ -41,43 +59,16 @@ impl HotkeyController {
             *guard = bindings;
         }
     }
-
-    pub fn begin_capture(&self, target: BindingTarget) {
-        if let Ok(mut guard) = self.shared.capture.lock() {
-            *guard = Some(target);
-        }
-    }
-
-    pub fn cancel_capture(&self) {
-        if let Ok(mut guard) = self.shared.capture.lock() {
-            *guard = None;
-        }
-    }
 }
 
-/// Start the hook thread. Never returns on its own; the process exit tears it down.
-pub fn spawn_hotkey_thread(initial: Bindings, out: AppHandle) -> HotkeyController {
-    let shared = Arc::new(HotkeyShared {
-        bindings: RwLock::new(initial),
-        capture: Mutex::new(None),
-    });
-    let controller = HotkeyController {
-        shared: Arc::clone(&shared),
-    };
-    // Nothing joins this thread: `rdev` has no stop API, the callback blocks in
-    // `GetMessageA` forever and the process exit tears it down.
-    if let Err(e) = std::thread::Builder::new()
-        .name("knobify-hotkeys".into())
-        .spawn(move || run_hook(shared, out))
-    {
-        // The knob is dead, but the tray, Settings and the OSD still work, so
-        // stay up and say why.
-        log::error!("cannot start the hotkey thread ({e}); bound keys will not work");
-    }
-    controller
+/// Whether a key event is a press or a release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    Down,
+    Up,
 }
 
-/// What the hook callback should do with one event.
+/// What the hook should do with one key event.
 #[derive(Debug)]
 struct Decision {
     emit: Option<AppEvent>,
@@ -91,434 +82,286 @@ impl Decision {
     };
 }
 
-/// Pure decision logic shared by the `grab` and `listen` callbacks.
-///
-/// `swallow_release` is per-callback state (which physical key, if any, had
-/// its press swallowed and therefore needs its matching release swallowed
-/// too) — it lives in the hook thread's closure, never behind a lock.
+/// Start the hook thread. It runs for the life of the process: a low-level hook
+/// belongs to the thread that installed it and dies with it.
+pub fn spawn_hotkey_thread(initial: Bindings, out: AppHandle) -> HotkeyController {
+    let shared = Arc::new(HotkeyShared {
+        bindings: RwLock::new(initial),
+    });
+    let controller = HotkeyController {
+        shared: Arc::clone(&shared),
+    };
+    // Built here, on the UI thread, so the hook thread never has to: it also
+    // starts the waker thread the callback pokes.
+    let hook_out = HookSender::new(&out);
+    if let Err(e) = std::thread::Builder::new()
+        .name("knobify-hotkeys".into())
+        .spawn(move || run_hook(shared, out, hook_out))
+    {
+        // The tray, Settings and the popup still work, so stay up and say why.
+        log::error!("cannot start the hotkey thread ({e}); bound keys will not work");
+    }
+    controller
+}
+
+/// Decide what to do with one key event. Pure, so it can be tested without a
+/// hook: `swallow_release` is the callback's own state, not shared with anyone.
 fn decide(
     shared: &HotkeyShared,
-    swallow_release: &Cell<Option<rdev::Key>>,
-    event: &rdev::Event,
+    swallow_release: &Cell<Option<u32>>,
+    vk: u32,
+    kind: KeyKind,
 ) -> Decision {
-    match event.event_type {
-        rdev::EventType::KeyPress(key) => on_key_press(shared, swallow_release, key),
-        rdev::EventType::KeyRelease(key) => on_key_release(swallow_release, key),
-        // Mouse move/click/wheel: never bound to anything, pass through with
-        // zero work.
-        _ => Decision::PASS,
+    match kind {
+        KeyKind::Up => {
+            if swallow_release.get() == Some(vk) {
+                swallow_release.set(None);
+                Decision {
+                    emit: None,
+                    swallow: true,
+                }
+            } else {
+                Decision::PASS
+            }
+        }
+        KeyKind::Down => {
+            // `try_read`: contended or poisoned counts as "not bound", which
+            // loses one keystroke rather than the whole hook.
+            let Ok(bindings) = shared.bindings.try_read() else {
+                return Decision::PASS;
+            };
+            match match_key(&bindings, &KeyCode::from_vk(vk)) {
+                Some(action) => {
+                    let swallow = bindings.suppress;
+                    if swallow {
+                        swallow_release.set(Some(vk));
+                    }
+                    Decision {
+                        emit: Some(AppEvent::Hotkey(action)),
+                        swallow,
+                    }
+                }
+                None => Decision::PASS,
+            }
+        }
     }
 }
 
-fn on_key_press(
-    shared: &HotkeyShared,
-    swallow_release: &Cell<Option<rdev::Key>>,
-    key: rdev::Key,
-) -> Decision {
-    // `try_lock`: contended or poisoned is treated as "not capturing" so the
-    // hook never blocks waiting on the UI thread.
-    let captured_target = match shared.capture.try_lock() {
-        Ok(mut guard) => guard.take(),
-        Err(_) => None,
+#[cfg(windows)]
+fn run_hook(shared: Arc<HotkeyShared>, out: AppHandle, hook_out: HookSender) {
+    use std::cell::RefCell;
+    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION,
+        HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
+        WM_SYSKEYUP, WM_TIMER,
     };
 
-    if let Some(target) = captured_target {
-        swallow_release.set(Some(key));
-        let emit = if key == rdev::Key::Escape {
-            AppEvent::CaptureCancelled
-        } else {
-            AppEvent::KeyCaptured {
-                target,
-                key: key_to_keycode(key),
-            }
-        };
-        return Decision {
-            emit: Some(emit),
-            swallow: true,
-        };
+    /// Everything the callback needs. It lives in a thread local because a
+    /// low-level hook callback always runs on the thread that installed the
+    /// hook, which sidesteps sharing it (the channel sender inside
+    /// `HookSender` is `Send` but not `Sync`).
+    struct HookState {
+        shared: Arc<HotkeyShared>,
+        out: HookSender,
+        swallow_release: Cell<Option<u32>>,
     }
 
-    let code = key_to_keycode(key);
-    let bindings = match shared.bindings.try_read() {
-        Ok(guard) => guard,
-        Err(_) => return Decision::PASS,
-    };
+    thread_local! {
+        static STATE: RefCell<Option<HookState>> = const { RefCell::new(None) };
+    }
 
-    match match_key(&bindings, &code) {
-        Some(action) => {
-            let swallow = bindings.suppress;
-            if swallow {
-                swallow_release.set(Some(key));
-            }
-            log::debug!("hotkey bound: {code} -> {action:?} (suppress={swallow})");
-            Decision {
-                emit: Some(AppEvent::Hotkey(action)),
-                swallow,
+    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            let kind = match wparam as u32 {
+                WM_KEYDOWN | WM_SYSKEYDOWN => Some(KeyKind::Down),
+                WM_KEYUP | WM_SYSKEYUP => Some(KeyKind::Up),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                // SAFETY: for HC_ACTION on a keyboard hook, Windows guarantees
+                // `lparam` points at a `KBDLLHOOKSTRUCT` valid for this call.
+                let vk = unsafe { (*(lparam as *const KBDLLHOOKSTRUCT)).vkCode };
+                let swallow = STATE.with(|state| {
+                    let state = state.borrow();
+                    let Some(state) = state.as_ref() else {
+                        return false;
+                    };
+                    let decision = decide(&state.shared, &state.swallow_release, vk, kind);
+                    if let Some(event) = decision.emit {
+                        state.out.send(event);
+                    }
+                    decision.swallow
+                });
+                if swallow {
+                    // Non-zero: the key goes no further, not even to the
+                    // foreground application.
+                    return 1;
+                }
             }
         }
-        None => Decision::PASS,
-    }
-}
-
-fn on_key_release(swallow_release: &Cell<Option<rdev::Key>>, key: rdev::Key) -> Decision {
-    if swallow_release.get() == Some(key) {
-        swallow_release.set(None);
-        Decision {
-            emit: None,
-            swallow: true,
-        }
-    } else {
-        Decision::PASS
-    }
-}
-
-fn run_hook(shared: Arc<HotkeyShared>, out: AppHandle) {
-    #[cfg(feature = "listen-only")]
-    {
-        out.send(AppEvent::HookFallback("built with listen-only".into()));
-        run_listen(shared, out);
+        // SAFETY: single FFI call. The first argument is ignored for low-level
+        // hooks, which is why the handle does not need keeping.
+        unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
     }
 
-    #[cfg(not(feature = "listen-only"))]
-    {
-        log::info!("global key hook: grab mode (bound keys can be swallowed)");
-        run_grab(shared, out);
-    }
-}
-
-#[cfg(not(feature = "listen-only"))]
-fn run_grab(shared: Arc<HotkeyShared>, out: AppHandle) {
-    let grab_shared = Arc::clone(&shared);
-    let grab_out = out.clone();
-    let swallow_release = Cell::new(None);
-    let callback = move |event: rdev::Event| -> Option<rdev::Event> {
-        let decision = decide(&grab_shared, &swallow_release, &event);
-        if let Some(app_event) = decision.emit {
-            grab_out.send(app_event);
-        }
-        if decision.swallow {
+    /// SAFETY of the calls inside: a null module handle with thread id 0 is how
+    /// a global low-level hook is installed, and `hook_proc` is `'static`.
+    fn install() -> Option<HHOOK> {
+        let hook =
+            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), std::ptr::null_mut(), 0) };
+        if hook.is_null() {
             None
         } else {
-            Some(event)
+            Some(hook)
         }
-    };
+    }
 
-    if let Err(e) = rdev::grab(callback) {
+    STATE.with(|state| {
+        *state.borrow_mut() = Some(HookState {
+            shared,
+            out: hook_out,
+            swallow_release: Cell::new(None),
+        });
+    });
+
+    let Some(mut hook) = install() else {
+        let error = std::io::Error::last_os_error();
+        log::error!("could not install the keyboard hook: {error}");
         out.send(AppEvent::HookFallback(format!(
-            "installing the low-level keyboard hook failed ({e:?}); \
-             falling back to a passive listener (key suppression unavailable)"
+            "Windows refused the keyboard hook ({error}); bound keys will not work"
         )));
-        run_listen(shared, out);
-    }
-}
-
-fn run_listen(shared: Arc<HotkeyShared>, out: AppHandle) {
-    let swallow_release = Cell::new(None);
-    let callback = move |event: rdev::Event| {
-        let decision = decide(&shared, &swallow_release, &event);
-        if decision.swallow {
-            // `listen` only observes; the key reaches Windows anyway.
-            log::trace!("cannot swallow {:?} in listen mode", event.event_type);
-        }
-        if let Some(app_event) = decision.emit {
-            out.send(app_event);
-        }
+        return;
     };
-    log::info!("global key hook: listen mode (key suppression unavailable)");
-    if let Err(e) = rdev::listen(callback) {
-        log::error!("rdev::listen failed to install the low-level hooks: {e:?}");
+    log::info!("global key hook installed (bound keys can be swallowed)");
+
+    // A thread timer, so the message loop below wakes up on its own.
+    // SAFETY: a null window with a non-zero id creates a thread timer whose
+    // WM_TIMER arrives in this thread's queue.
+    unsafe { SetTimer(std::ptr::null_mut(), 1, REARM_INTERVAL_MS, None) };
+
+    // The hook is only dispatched while this thread retrieves messages, and
+    // Windows destroys it when the thread exits - so this loop is the hook's
+    // life, and it also re-arms it (see the module docs).
+    // SAFETY: `msg` is a live local; a null window means "any message".
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            // 0 is WM_QUIT and -1 an error; both are sticky, so returning here
+            // would drop the hook and looping straight back would spin a core.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        if msg.message == WM_TIMER {
+            unsafe { UnhookWindowsHookEx(hook) };
+            match install() {
+                Some(fresh) => hook = fresh,
+                None => {
+                    let error = std::io::Error::last_os_error();
+                    log::error!("could not re-arm the keyboard hook: {error}");
+                    // Try again on the next tick rather than giving up.
+                }
+            }
+        }
     }
 }
 
-/// `rdev::Key` -> backend-independent code (`Unknown(vk)` -> `Raw`, else the variant name).
-pub fn key_to_keycode(key: rdev::Key) -> KeyCode {
-    match key {
-        rdev::Key::Unknown(code) => KeyCode::Raw(code),
-        other => KeyCode::Named(format!("{other:?}")),
-    }
+#[cfg(not(windows))]
+fn run_hook(_shared: Arc<HotkeyShared>, out: AppHandle, _hook_out: HookSender) {
+    out.send(AppEvent::HookFallback(
+        "global hotkeys are only implemented for Windows".to_owned(),
+    ));
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
-
+    use super::*;
     use knobify_core::HotkeyAction;
 
-    use super::*;
+    /// F13 and F15: what the knob this was written for actually sends.
+    const VK_F13: u32 = 0x7C;
+    const VK_F15: u32 = 0x7E;
+    const VK_A: u32 = 0x41;
 
     fn shared_with(bindings: Bindings) -> HotkeyShared {
         HotkeyShared {
             bindings: RwLock::new(bindings),
-            capture: Mutex::new(None),
         }
     }
 
-    fn key_event(event_type: rdev::EventType) -> rdev::Event {
-        rdev::Event {
-            time: SystemTime::now(),
-            name: None,
-            event_type,
-        }
-    }
-
-    fn suppressing_bindings() -> Bindings {
+    fn knob_bindings(suppress: bool) -> Bindings {
         Bindings {
-            volume_up: KeyCode::Raw(0x82),
-            volume_down: KeyCode::Raw(0x81),
+            volume_up: KeyCode::Raw(VK_F13),
+            volume_down: KeyCode::Raw(VK_F15),
             mute: None,
-            suppress: true,
+            suppress,
         }
     }
 
     #[test]
-    fn bound_key_with_suppress_swallows_and_emits_hotkey() {
-        let shared = shared_with(suppressing_bindings());
+    fn bound_key_emits_its_action_and_passes_through_by_default() {
+        let shared = shared_with(knob_bindings(false));
         let swallow_release = Cell::new(None);
-        let event = key_event(rdev::EventType::KeyPress(rdev::Key::Unknown(0x82)));
 
-        let decision = decide(&shared, &swallow_release, &event);
+        let decision = decide(&shared, &swallow_release, VK_F13, KeyKind::Down);
 
-        assert!(decision.swallow);
+        assert!(
+            !decision.swallow,
+            "suppress is off, Windows must still see it"
+        );
         assert!(matches!(
             decision.emit,
             Some(AppEvent::Hotkey(HotkeyAction::VolumeUp))
         ));
-        // The press was swallowed, so the matching release must be too.
-        assert_eq!(swallow_release.get(), Some(rdev::Key::Unknown(0x82)));
+        assert_eq!(swallow_release.get(), None);
     }
 
     #[test]
-    fn bound_key_without_suppress_passes_through_and_emits_hotkey() {
-        let mut bindings = suppressing_bindings();
-        bindings.suppress = false;
-        let shared = shared_with(bindings);
+    fn bound_key_is_swallowed_when_suppress_is_on() {
+        let shared = shared_with(knob_bindings(true));
         let swallow_release = Cell::new(None);
-        let event = key_event(rdev::EventType::KeyPress(rdev::Key::Unknown(0x81)));
 
-        let decision = decide(&shared, &swallow_release, &event);
+        let decision = decide(&shared, &swallow_release, VK_F15, KeyKind::Down);
 
-        assert!(!decision.swallow);
+        assert!(decision.swallow);
         assert!(matches!(
             decision.emit,
             Some(AppEvent::Hotkey(HotkeyAction::VolumeDown))
         ));
+        // The release has to go too, or apps see a key that was never pressed.
+        assert_eq!(swallow_release.get(), Some(VK_F15));
+        let release = decide(&shared, &swallow_release, VK_F15, KeyKind::Up);
+        assert!(release.swallow);
         assert_eq!(swallow_release.get(), None);
+        // ... but only once.
+        assert!(!decide(&shared, &swallow_release, VK_F15, KeyKind::Up).swallow);
+    }
+
+    #[test]
+    fn a_named_binding_matches_the_same_physical_key() {
+        let shared = shared_with(Bindings {
+            volume_up: KeyCode::named("F13"),
+            ..knob_bindings(false)
+        });
+        let swallow_release = Cell::new(None);
+
+        let decision = decide(&shared, &swallow_release, VK_F13, KeyKind::Down);
+
+        assert!(matches!(
+            decision.emit,
+            Some(AppEvent::Hotkey(HotkeyAction::VolumeUp))
+        ));
     }
 
     #[test]
     fn unbound_key_passes_through_with_no_event() {
-        let shared = shared_with(suppressing_bindings());
+        let shared = shared_with(knob_bindings(true));
         let swallow_release = Cell::new(None);
-        let event = key_event(rdev::EventType::KeyPress(rdev::Key::KeyA));
 
-        let decision = decide(&shared, &swallow_release, &event);
+        let decision = decide(&shared, &swallow_release, VK_A, KeyKind::Down);
 
         assert!(!decision.swallow);
         assert!(decision.emit.is_none());
-    }
-
-    #[test]
-    fn capture_mode_reports_key_captured_and_swallows() {
-        let shared = shared_with(Bindings::default());
-        *shared.capture.lock().unwrap() = Some(BindingTarget::Mute);
-        let swallow_release = Cell::new(None);
-        let event = key_event(rdev::EventType::KeyPress(rdev::Key::Function));
-
-        let decision = decide(&shared, &swallow_release, &event);
-
-        assert!(decision.swallow);
-        match decision.emit {
-            Some(AppEvent::KeyCaptured { target, key }) => {
-                assert_eq!(target, BindingTarget::Mute);
-                assert_eq!(key, KeyCode::named("Function"));
-            }
-            other => panic!("expected KeyCaptured, got {other:?}"),
-        }
-        // Capture is one-shot: the slot must be cleared.
-        assert!(shared.capture.lock().unwrap().is_none());
-        assert_eq!(swallow_release.get(), Some(rdev::Key::Function));
-    }
-
-    #[test]
-    fn capture_mode_escape_cancels() {
-        let shared = shared_with(Bindings::default());
-        *shared.capture.lock().unwrap() = Some(BindingTarget::VolumeUp);
-        let swallow_release = Cell::new(None);
-        let event = key_event(rdev::EventType::KeyPress(rdev::Key::Escape));
-
-        let decision = decide(&shared, &swallow_release, &event);
-
-        assert!(decision.swallow);
-        assert!(matches!(decision.emit, Some(AppEvent::CaptureCancelled)));
-        assert!(shared.capture.lock().unwrap().is_none());
-    }
-
-    #[test]
-    fn release_after_swallowed_press_is_swallowed_once() {
-        let shared = shared_with(suppressing_bindings());
-        let swallow_release = Cell::new(None);
-        let press = key_event(rdev::EventType::KeyPress(rdev::Key::Unknown(0x82)));
-        let release = key_event(rdev::EventType::KeyRelease(rdev::Key::Unknown(0x82)));
-
-        let press_decision = decide(&shared, &swallow_release, &press);
-        assert!(press_decision.swallow);
-
-        let release_decision = decide(&shared, &swallow_release, &release);
-        assert!(release_decision.swallow);
-        assert!(release_decision.emit.is_none());
-        assert_eq!(swallow_release.get(), None);
-
-        // A second release (or a release of some other key) is not swallowed.
-        let release_decision2 = decide(&shared, &swallow_release, &release);
-        assert!(!release_decision2.swallow);
-    }
-
-    #[test]
-    fn mouse_events_always_pass_through() {
-        let shared = shared_with(suppressing_bindings());
-        let swallow_release = Cell::new(None);
-
-        for event_type in [
-            rdev::EventType::MouseMove { x: 1.0, y: 2.0 },
-            rdev::EventType::ButtonPress(rdev::Button::Left),
-            rdev::EventType::ButtonRelease(rdev::Button::Left),
-            rdev::EventType::Wheel {
-                delta_x: 0,
-                delta_y: 1,
-            },
-        ] {
-            let event = key_event(event_type);
-            let decision = decide(&shared, &swallow_release, &event);
-            assert!(!decision.swallow);
-            assert!(decision.emit.is_none());
-        }
-    }
-
-    #[test]
-    fn emitted_events_reach_the_app_handle() {
-        let (handle, rx) = AppHandle::new(egui::Context::default());
-        let shared = shared_with(suppressing_bindings());
-        let swallow_release = Cell::new(None);
-        let event = key_event(rdev::EventType::KeyPress(rdev::Key::Unknown(0x82)));
-
-        let decision = decide(&shared, &swallow_release, &event);
-        if let Some(app_event) = decision.emit {
-            handle.send(app_event);
-        }
-
-        let received = rx.try_recv().expect("expected an emitted AppEvent");
-        assert!(matches!(received, AppEvent::Hotkey(HotkeyAction::VolumeUp)));
-    }
-
-    #[test]
-    fn key_to_keycode_maps_unknown_to_raw_and_named_otherwise() {
-        assert_eq!(key_to_keycode(rdev::Key::Unknown(0x82)), KeyCode::Raw(0x82));
-        assert_eq!(
-            key_to_keycode(rdev::Key::Function),
-            KeyCode::named("Function")
-        );
-    }
-
-    /// Named keys are stored as `format!("{key:?}")`, and `KeyCode::from_str`
-    /// only accepts ASCII alphanumerics, so a `Debug` name with a space or a
-    /// symbol in it would write a config file that cannot be read back. rdev
-    /// 0.5.3 has no such variant; this covers every naming shape it does have
-    /// (and `Unknown`, which never goes through the name path).
-    #[test]
-    fn every_key_name_round_trips_through_the_config_form() {
-        use std::str::FromStr as _;
-
-        let keys = [
-            rdev::Key::Alt,
-            rdev::Key::AltGr,
-            rdev::Key::BackQuote,
-            rdev::Key::BackSlash,
-            rdev::Key::Backspace,
-            rdev::Key::CapsLock,
-            rdev::Key::Comma,
-            rdev::Key::ControlLeft,
-            rdev::Key::Delete,
-            rdev::Key::Dot,
-            rdev::Key::DownArrow,
-            rdev::Key::Equal,
-            rdev::Key::Escape,
-            rdev::Key::F12,
-            rdev::Key::Function,
-            rdev::Key::Insert,
-            rdev::Key::IntlBackslash,
-            rdev::Key::KeyA,
-            rdev::Key::Kp0,
-            rdev::Key::KpDelete,
-            rdev::Key::KpDivide,
-            rdev::Key::KpMinus,
-            rdev::Key::KpMultiply,
-            rdev::Key::KpPlus,
-            rdev::Key::KpReturn,
-            rdev::Key::LeftBracket,
-            rdev::Key::MetaLeft,
-            rdev::Key::Minus,
-            rdev::Key::Num0,
-            rdev::Key::NumLock,
-            rdev::Key::PageDown,
-            rdev::Key::Pause,
-            rdev::Key::PrintScreen,
-            rdev::Key::Quote,
-            rdev::Key::Return,
-            rdev::Key::ScrollLock,
-            rdev::Key::SemiColon,
-            rdev::Key::ShiftLeft,
-            rdev::Key::Slash,
-            rdev::Key::Space,
-            rdev::Key::Tab,
-            rdev::Key::UpArrow,
-            // Media keys are `Unknown` in rdev 0.5.3 (0xAD is VK_VOLUME_MUTE).
-            rdev::Key::Unknown(0xAD),
-        ];
-
-        for key in keys {
-            let code = key_to_keycode(key);
-            let text = code.to_config_string();
-            let parsed = KeyCode::from_str(&text)
-                .unwrap_or_else(|e| panic!("{key:?} -> {text:?} does not parse back: {e}"));
-            assert_eq!(parsed, code, "{key:?} did not round-trip");
-        }
-    }
-
-    #[test]
-    fn controller_bindings_and_capture_round_trip() {
-        let (handle, _rx) = AppHandle::new(egui::Context::default());
-        let controller = spawn_disabled_controller();
-
-        let capturing = || {
-            controller
-                .shared
-                .capture
-                .lock()
-                .map(|guard| *guard)
-                .unwrap_or(None)
-        };
-
-        assert_eq!(capturing(), None);
-        controller.begin_capture(BindingTarget::VolumeUp);
-        assert_eq!(capturing(), Some(BindingTarget::VolumeUp));
-        controller.cancel_capture();
-        assert_eq!(capturing(), None);
-
-        let bindings = Bindings {
-            volume_up: KeyCode::named("Function"),
-            ..Bindings::default()
-        };
-        controller.set_bindings(bindings.clone());
-        assert_eq!(*controller.shared.bindings.read().unwrap(), bindings);
-
-        let _ = handle;
-    }
-
-    /// A `HotkeyController` over shared state with no hook thread attached —
-    /// exercises the controller API without touching rdev.
-    fn spawn_disabled_controller() -> HotkeyController {
-        HotkeyController {
-            shared: Arc::new(HotkeyShared::default()),
-        }
     }
 }

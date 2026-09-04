@@ -6,6 +6,7 @@
 //!   pixels (excludes the taskbar).
 //! * `set_rounded_corners`: `DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE)`
 //!   for the opaque fallback on Windows 11.
+//! * `poll_pressed_key`: what key is being pressed right now, for rebinding.
 //!
 //! Every `unsafe` block is a single FFI call; the invariant it relies on is
 //! stated above it. `hwnd` is always the root window's handle, obtained on the
@@ -33,12 +34,47 @@ impl Rect {
     }
 }
 
+/// The virtual-key code of a key that has just been pressed, if any.
+///
+/// Asks Windows directly (`GetAsyncKeyState`) rather than waiting for the
+/// keyboard hook, so rebinding a key works even if the hook is not delivering:
+/// the low bit of the result means "pressed since this was last called", which
+/// is exactly the transition a rebind is waiting for.
+///
+/// Mouse buttons and modifiers are skipped: a knob is neither, and a keyboard
+/// that emits its own modifier before the real key must not bind Shift.
+#[cfg(windows)]
+pub fn poll_pressed_key() -> Option<u32> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    /// Left/right mouse and the modifier codes, which are never a binding.
+    const SKIP: &[u32] = &[
+        0x01, 0x02, 0x04, 0x05, 0x06, 0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4,
+        0xA5,
+    ];
+
+    (0x07..=0xFEu32).find(|vk| {
+        if SKIP.contains(vk) {
+            return false;
+        }
+        // SAFETY: single FFI call with an in-range virtual-key code.
+        let state = unsafe { GetAsyncKeyState(*vk as i32) };
+        // Bit 0: the key was pressed since the previous call for this key.
+        state & 0x1 != 0
+    })
+}
+
+#[cfg(not(windows))]
+pub fn poll_pressed_key() -> Option<u32> {
+    None
+}
+
 #[cfg(windows)]
 pub fn apply_osd_exstyles(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
-        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE,
-        WS_EX_TOOLWINDOW,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     };
 
     let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
@@ -46,11 +82,13 @@ pub fn apply_osd_exstyles(hwnd: isize) {
     // SAFETY: single FFI call on a live HWND owned by this thread. `GWL_EXSTYLE`
     // reads the window's 32-bit extended style word and touches nothing else.
     let current = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
-    let wanted = current | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    // `WS_EX_TRANSPARENT` alone passes clicks through. `WS_EX_LAYERED` must be
+    // cleared: layered compositing of the OpenGL surface fails on real
+    // hardware, leaving a window that paints but is never seen.
+    let wanted =
+        (current | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT) & !WS_EX_LAYERED;
 
-    // SAFETY: as above, but writing back the same style word. We only add bits,
-    // so winit's own styles (WS_EX_TRANSPARENT | WS_EX_LAYERED for mouse
-    // passthrough) are preserved.
+    // SAFETY: as above, but writing back the same style word.
     unsafe {
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as _);
     }

@@ -1,4 +1,4 @@
-//! The eframe application: owns all state, routes events, drives the OSD root
+﻿//! The eframe application: owns all state, routes events, drives the OSD root
 //! window and the Settings child viewport. Finalised by WP5 (integration).
 
 use std::path::PathBuf;
@@ -10,7 +10,9 @@ use knobify_core::config;
 use knobify_core::spotify::{
     spawn_spotify, AuthState, SpotifyCmd, SpotifyConfig, SpotifyEvent, SpotifyHandle, UserFacing,
 };
-use knobify_core::{AppEvent, BindingTarget, HotkeyAction, Settings, TrayAction, VolumeModel};
+use knobify_core::{
+    AppEvent, BindingTarget, HotkeyAction, KeyCode, Settings, TrayAction, VolumeModel,
+};
 
 use crate::handle::AppHandle;
 use crate::hotkeys::{spawn_hotkey_thread, HotkeyController};
@@ -99,6 +101,45 @@ impl KnobifyApp {
         self.settings.client_id.trim().is_empty()
     }
 
+    /// While a rebind is waiting, take the first key Windows reports as pressed
+    /// and make it the binding.
+    ///
+    /// This asks Windows directly rather than waiting for the keyboard hook, so
+    /// rebinding works even when the hook is not delivering - which is worth the
+    /// polling, because a rebind that silently does nothing leaves the user with
+    /// no way to fix a wrong binding.
+    fn poll_capture(&mut self, ctx: &egui::Context) {
+        let Some(state) = self.settings_ui.clone() else {
+            return;
+        };
+        let Ok(target) = state.lock().map(|s| s.capture) else {
+            return;
+        };
+        let Some(target) = target else { return };
+
+        // Keep polling: this must be the ROOT viewport, because that is the one
+        // whose pass runs `App::logic`. Repainting the settings viewport instead
+        // runs only its own callback, which polls nothing - so the rebind would
+        // sample the keyboard once and then wait forever.
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+
+        let Some(vk) = crate::win::poll_pressed_key() else {
+            return;
+        };
+        let key = KeyCode::from_vk(vk);
+        log::info!("rebound {target:?} to {key} (vk 0x{vk:02X})");
+        self.with_settings_ui(ctx, |s| {
+            match target {
+                BindingTarget::VolumeUp => s.draft.bindings.volume_up = key.clone(),
+                BindingTarget::VolumeDown => s.draft.bindings.volume_down = key.clone(),
+                BindingTarget::Mute => s.draft.bindings.mute = Some(key.clone()),
+            }
+            s.capture = None;
+            s.status_line = Some(format!("{} set to {key}. Save to apply.", target.label()));
+            s.status_is_error = false;
+        });
+    }
+
     /// Edit the settings window's shared state (if it is open) and repaint it.
     fn with_settings_ui(&self, ctx: &egui::Context, edit: impl FnOnce(&mut SettingsState)) {
         let Some(state) = &self.settings_ui else {
@@ -164,35 +205,21 @@ impl KnobifyApp {
                     HotkeyAction::MuteToggle => self.volume.toggle_mute(),
                 };
                 self.last_tick = Some(now);
+                // Logged here rather than in the hook, where writing to a file
+                // risks the callback being timed out and the hook destroyed.
+                log::debug!("{action:?} -> {new_volume}%");
                 self.spotify.set_volume(new_volume);
                 self.show_volume(now, true);
             }
-            AppEvent::KeyCaptured { target, key } => {
-                // The hook clears its own one-shot capture flag; this covers the
-                // `listen` fallback, where the event may arrive more than once.
-                self.hotkeys.cancel_capture();
-                self.with_settings_ui(ctx, |s| {
-                    match target {
-                        BindingTarget::VolumeUp => s.draft.bindings.volume_up = key,
-                        BindingTarget::VolumeDown => s.draft.bindings.volume_down = key,
-                        BindingTarget::Mute => s.draft.bindings.mute = Some(key),
-                    }
-                    s.capture = None;
-                });
-            }
-            AppEvent::CaptureCancelled => {
-                self.hotkeys.cancel_capture();
-                self.with_settings_ui(ctx, |s| s.capture = None);
-            }
             AppEvent::HookFallback(reason) => {
-                log::warn!("key hook fallback: {reason}");
+                log::warn!("key hook unavailable: {reason}");
                 self.suppress_unavailable = true;
                 self.with_settings_ui(ctx, |s| s.suppress_unavailable = true);
             }
             AppEvent::Tray(TrayAction::OpenSettings) => self.open_settings(),
             AppEvent::Tray(TrayAction::LoginOrLogout) => {
                 if self.needs_setup() {
-                    // The tray item reads "Set up Spotify…" in this state.
+                    // The tray item reads "Set up Spotifyâ€¦" in this state.
                     self.open_settings();
                 } else if self.auth.is_logged_in() {
                     self.spotify.send(SpotifyCmd::Logout);
@@ -312,18 +339,26 @@ impl KnobifyApp {
                 SettingsAction::CancelLogin => self.spotify.send(SpotifyCmd::CancelLogin),
                 SettingsAction::Logout => self.spotify.send(SpotifyCmd::Logout),
                 SettingsAction::Capture(target) => {
-                    self.hotkeys.begin_capture(target);
-                    self.with_settings_ui(ctx, |s| s.capture = Some(target));
+                    // Drain whatever is already held down, so the click that
+                    // started the rebind cannot be mistaken for the new key.
+                    let _ = crate::win::poll_pressed_key();
+                    log::info!("waiting for a key to bind to {target:?}");
+                    self.with_settings_ui(ctx, |s| {
+                        s.capture = Some(target);
+                        s.status_line = Some(format!("Press the key for {}â€¦", target.label()));
+                        s.status_is_error = false;
+                    });
                 }
                 SettingsAction::CancelCapture => {
-                    self.hotkeys.cancel_capture();
-                    self.with_settings_ui(ctx, |s| s.capture = None);
+                    self.with_settings_ui(ctx, |s| {
+                        s.capture = None;
+                        s.status_line = None;
+                    });
                 }
                 SettingsAction::PreviewOsd => self.show_volume(now, false),
                 SettingsAction::Close => {
-                    // Covers both the Close button and the window's X: the
-                    // capture must not outlive the window that started it.
-                    self.hotkeys.cancel_capture();
+                    // Dropping the state ends any rebind with it: the capture
+                    // must not outlive the window that started it.
                     // Not showing the deferred viewport in `App::ui` closes it.
                     self.settings_ui = None;
                 }
@@ -383,12 +418,15 @@ impl eframe::App for KnobifyApp {
             self.handle_event(event, ctx, now);
         }
         self.drain_settings_actions(ctx, now);
+        self.poll_capture(ctx);
 
-        if self.osd.needs_reposition {
-            if let Some(pos) = osd::compute_position(frame, ctx, &self.settings.osd) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                self.osd.needs_reposition = false;
-            }
+        // Only ever place the window while it has something to show: while idle
+        // it is parked off-screen (that is what makes it invisible), and moving
+        // it onto the desktop for a settings change would leave it there.
+        if self.osd.needs_reposition && self.osd.is_visible(now) {
+            let pos = osd::compute_position(frame, ctx, &self.settings.osd);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+            self.osd.needs_reposition = false;
         }
         let keep_visible = self.settings_ui.is_some();
         self.osd

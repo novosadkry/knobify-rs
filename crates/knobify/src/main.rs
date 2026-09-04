@@ -52,11 +52,20 @@ impl Write for LogSink {
     }
 }
 
-/// `info` by default, `RUST_LOG` still honoured. Returns the log file path when
-/// one could be opened (it is truncated on every start).
+/// Everything at `info`, except rspotify's HTTP layer, which logs whole
+/// `RequestBuilder`s - **including the `Authorization: Bearer ...` header** - at
+/// info level. That would write a live access token into a file on disk that
+/// users are asked to paste when reporting problems, so it is muted to `warn`
+/// here. `RUST_LOG` still overrides all of it (`RUST_LOG=debug` re-enables the
+/// token logging, so prefer `RUST_LOG=knobify=debug` when troubleshooting).
+const DEFAULT_LOG_FILTER: &str = "info,rspotify_http=warn";
+
+/// Returns the log file path when one could be opened (it is truncated on
+/// every start).
 fn init_logging(dir: Option<&Path>) -> Option<PathBuf> {
-    let mut builder =
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(DEFAULT_LOG_FILTER),
+    );
 
     let path = dir.map(|dir| dir.join(LOG_FILE_NAME));
     let opened = path.as_ref().and_then(|path| {

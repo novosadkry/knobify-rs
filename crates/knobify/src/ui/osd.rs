@@ -1,20 +1,30 @@
-//! The on-screen volume popup. It is the *root* eframe window: always mapped,
-//! transparent, click-through, topmost; it paints nothing while idle.
+//! The on-screen volume popup: the *root* eframe window, frameless,
+//! click-through, topmost, and hidden whenever it has nothing to say.
 //!
-//! # Why the root window is never hidden (transparent mode)
+//! # How "invisible while idle" is achieved, and two ways that failed
 //!
-//! eframe runs only `App::logic` for a root viewport that is not being shown
-//! and processes only viewport *commands* there, so a hidden root can neither
-//! create nor show the Settings child viewport, and its repaints are throttled
-//! to a 100 ms heartbeat. Therefore the transparent popup stays mapped forever
-//! and simply paints nothing while `hide_at` is `None`; `clear_color` is fully
-//! transparent, so an empty pass is an invisible window.
+//! Two tempting shortcuts were both tried and rejected on real hardware:
 //!
-//! The opaque fallback (`osd.transparent == false`, for drivers without WGL
-//! alpha) has no such trick available: an empty pass would be a dark grey
-//! rectangle. There `tick` hides and shows the root with
-//! `ViewportCommand::Visible`, and keeps it mapped while Settings is open so
-//! the child viewport can still be created.
+//! * Painting nothing into a transparent window. Whether a window really has a
+//!   usable alpha channel is up to the OpenGL driver, and where it has none an
+//!   empty pass is a grey rectangle sitting on the desktop forever.
+//! * Leaving it mapped and moving it off-screen. Mouse passthrough makes winit
+//!   add `WS_EX_LAYERED`, and a layered window moved off-screen and back is not
+//!   re-composited: it stays invisible even while painting at full opacity,
+//!   which is far worse than a rectangle.
+//!
+//! So the window is genuinely hidden and shown with
+//! `ViewportCommand::Visible`, which is what eframe itself does after the first
+//! frame and therefore composites correctly. The cost is eframe's 100 ms
+//! repaint heartbeat while hidden, which no one can see.
+//!
+//! One exception: a hidden root can neither create nor show the Settings child
+//! viewport (eframe runs only `App::logic` for a root that is not shown, and
+//! processes only viewport *commands* there). While Settings is open the window
+//! therefore stays mapped and is parked off-screen ([`PARKED_POS`]) instead.
+//!
+//! `osd.transparent` only decides how the panel is *drawn*, a soft alpha fill
+//! with rounded corners versus a solid one, never whether it is seen.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,8 +44,8 @@ const CORNER: f32 = 12.0;
 /// Horizontal padding inside the panel.
 const PAD_X: f32 = 14.0;
 
-/// Where the opaque fallback parks the root window while it has nothing to
-/// paint but must stay mapped (Settings open). Far outside any desktop.
+/// Where the root window waits while it has nothing to paint but must stay
+/// mapped. Far outside any desktop, on any monitor arrangement.
 const PARKED_POS: Pos2 = pos2(-32000.0, -32000.0);
 
 const FADE_IN: Duration = Duration::from_millis(120);
@@ -116,19 +126,18 @@ pub struct OsdState {
     pub needs_reposition: bool,
     /// When the current visible period started (drives the fade-in).
     shown_at: Option<Instant>,
-    /// Opaque fallback only: the visibility we last asked the root window for.
-    /// eframe maps the root itself after the first painted frame, hence `true`.
-    window_shown: bool,
-    /// Opaque fallback only: winit rewrites the whole `GWL_EXSTYLE` word when it
-    /// toggles visibility, wiping `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`; re-add
-    /// them on the pass after the command was handed to winit.
+    /// Re-apply `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` on the next pass: winit
+    /// rewrites the whole `GWL_EXSTYLE` word whenever it changes a window flag.
     restyle_pending: bool,
-    /// Passes seen so far, saturating at 2. eframe keeps the root window hidden
-    /// until it has painted once, so we must not fight it on the first pass.
-    passes: u8,
-    /// Opaque fallback only: the window is mapped just so the Settings viewport
-    /// can exist, and has been moved off-screen because it has nothing to show.
+    /// The window is mapped (so the Settings viewport can exist) but has been
+    /// moved off-screen because it has nothing to show.
     parked: bool,
+    /// The visibility last asked of the root window. eframe maps it itself
+    /// after the first painted frame, hence `true`.
+    window_shown: bool,
+    /// Passes seen, saturating at 2: eframe keeps the root hidden until it has
+    /// painted once, so a `Visible(false)` sent before that is simply undone.
+    passes: u8,
 }
 
 impl Default for OsdState {
@@ -142,10 +151,10 @@ impl Default for OsdState {
             hide_at: None,
             needs_reposition: true,
             shown_at: None,
-            window_shown: true,
             restyle_pending: false,
-            passes: 0,
             parked: false,
+            window_shown: true,
+            passes: 0,
         }
     }
 }
@@ -227,11 +236,11 @@ impl OsdState {
         }
     }
 
-    /// Called from `App::logic` every pass: expire, keep the root window's
-    /// visibility in sync (opaque fallback) and schedule the next repaint.
+    /// Called from `App::logic` every pass: expire, park or un-park the root
+    /// window, and schedule the next repaint.
     ///
     /// `keep_visible` must be true while the Settings viewport is open: a
-    /// hidden root cannot show a child viewport.
+    /// hidden root cannot host a child viewport.
     pub fn tick(
         &mut self,
         ctx: &egui::Context,
@@ -254,15 +263,19 @@ impl OsdState {
             None => {}
         }
 
-        self.sync_window_visibility(ctx, frame, osd, keep_visible);
+        self.sync_window_placement(ctx, frame, keep_visible);
     }
 
-    /// Opaque fallback: map/unmap the root window instead of painting nothing.
-    fn sync_window_visibility(
+    /// Show the root window only while the popup has something to say.
+    ///
+    /// Hiding it - rather than leaving it mapped and painting nothing - is what
+    /// makes the popup invisible while idle; see the module docs for why
+    /// neither the alpha channel nor an off-screen position can be trusted for
+    /// that.
+    fn sync_window_placement(
         &mut self,
         ctx: &egui::Context,
         frame: &eframe::Frame,
-        osd: &OsdSettings,
         keep_visible: bool,
     ) {
         if std::mem::take(&mut self.restyle_pending) {
@@ -271,39 +284,32 @@ impl OsdState {
             }
         }
 
-        if osd.transparent {
-            // The transparent root stays mapped forever (see the module docs).
-            return;
-        }
-
         let showing = self.hide_at.is_some();
-        let want = keep_visible || showing;
+        let want = showing || keep_visible;
         if want != self.window_shown {
             if !want && self.passes < 2 {
-                // eframe unhides the root only after its first painted frame; a
-                // `Visible(false)` sent before that would be undone right away.
-                // Nothing else asks for a repaint at startup, so ask here or the
-                // empty dark window would stay up until the first hotkey.
+                // eframe maps the root only after its first painted frame, so a
+                // `Visible(false)` now would be undone. Nothing else asks for a
+                // repaint at startup, so ask, or the window stays up until the
+                // first hotkey.
                 ctx.request_repaint();
                 return;
             }
             self.window_shown = want;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(want));
             if want {
+                // Where it goes is only known once it is about to be seen, and
+                // winit rewrote the extended styles when it changed visibility.
                 self.needs_reposition = true;
                 self.restyle_pending = true;
             }
         }
 
+        // Mapped only so the Settings viewport can exist: move it out of sight
+        // rather than leaving an empty window on the desktop.
         if want && !showing {
-            // Mapped only so the Settings viewport can be created: an opaque
-            // window paints a dark rectangle even with nothing in it, so move it
-            // out of sight instead of leaving it on top of the desktop. The real
-            // position is recomputed when the popup shows again.
-            self.needs_reposition = false;
             if !self.parked {
                 self.parked = true;
-                log::debug!("parking the opaque popup off-screen while it has nothing to show");
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(PARKED_POS));
             }
         } else if self.parked {
@@ -320,7 +326,12 @@ pub fn root_viewport_builder(osd: &OsdSettings) -> egui::ViewportBuilder {
         .with_decorations(false)
         .with_resizable(false)
         .with_always_on_top()
-        .with_mouse_passthrough(true)
+        // Deliberately *not* `with_mouse_passthrough`: winit implements that
+        // with `WS_EX_TRANSPARENT | WS_EX_LAYERED`, and a layered window over
+        // an OpenGL surface composites unreliably - it stayed invisible on real
+        // hardware even while painting at full opacity. `apply_osd_exstyles`
+        // sets `WS_EX_TRANSPARENT` on its own, which is all click-through
+        // needs, and clears `WS_EX_LAYERED` if anything adds it.
         .with_taskbar(false)
         .with_active(false)
         .with_inner_size(OSD_SIZE)
@@ -335,17 +346,25 @@ pub fn root_viewport_builder(osd: &OsdSettings) -> egui::ViewportBuilder {
     builder
 }
 
+/// Where the popup goes when the window system will not say anything about the
+/// monitors. Somewhere visible beats staying parked off-screen forever.
+const BLIND_POS: Pos2 = pos2(80.0, 80.0);
+
 /// Compute the outer position (logical points) for the popup on the primary
-/// monitor's work area. `None` when geometry is unavailable.
-pub fn compute_position(
-    frame: &eframe::Frame,
-    ctx: &egui::Context,
-    osd: &OsdSettings,
-) -> Option<egui::Pos2> {
-    let window = frame.winit_window()?;
-    let monitor = window
-        .primary_monitor()
-        .or_else(|| window.current_monitor())?;
+/// monitor's work area.
+///
+/// Always returns a position: the popup is parked off-screen while idle, so a
+/// placement that gave up would leave it invisible for the whole session
+/// instead of merely mispositioned.
+pub fn compute_position(frame: &eframe::Frame, ctx: &egui::Context, osd: &OsdSettings) -> Pos2 {
+    let Some(monitor) = frame.winit_window().and_then(|window| {
+        window
+            .primary_monitor()
+            .or_else(|| window.current_monitor())
+    }) else {
+        log::warn!("no monitor information available; showing the popup at {BLIND_POS:?}");
+        return BLIND_POS;
+    };
 
     // `ViewportCommand::OuterPosition` is multiplied by egui's own
     // pixels-per-point before it reaches winit, so that is the factor we must
@@ -400,7 +419,7 @@ pub fn compute_position(
         at.y,
     );
 
-    Some(at)
+    at
 }
 
 /// Guards the one info-level placement line per process.

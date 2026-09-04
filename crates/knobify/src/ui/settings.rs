@@ -287,7 +287,7 @@ fn show_bindings_section(ui: &mut egui::Ui, state: &mut SettingsState) {
                     ui.end_row();
                 }
             });
-        ui.small("The knob's OEM keys show up as names like \"Key 0x82\".");
+        ui.small("Knobs usually send a function key above F12, such as \"F13\".");
     });
 }
 
@@ -320,9 +320,7 @@ fn show_behaviour_section(ui: &mut egui::Ui, state: &mut SettingsState) {
             }
         });
         if suppress_disabled {
-            ui.small(
-                "Unavailable: the global key hook fell back to listen-only mode on this system.",
-            );
+            ui.small("Unavailable: Windows refused the global key hook on this system.");
         }
     });
 }
@@ -434,8 +432,13 @@ mod tests {
         let key = Some(KeyCode::named("VolumeUp"));
         assert_eq!(optional_binding_label(&key), "Volume Up");
 
-        let raw = Some(KeyCode::raw(0x82));
-        assert_eq!(optional_binding_label(&raw), "Key 0x82");
+        // 0x82 is VK_F19, so it gets the name rather than the number.
+        let f19 = Some(KeyCode::raw(0x82));
+        assert_eq!(optional_binding_label(&f19), "F19");
+
+        // A code Windows does not name falls back to the number.
+        let raw = Some(KeyCode::raw(0x07));
+        assert_eq!(optional_binding_label(&raw), "Key 0x07");
     }
 
     #[test]

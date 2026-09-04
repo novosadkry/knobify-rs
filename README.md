@@ -27,8 +27,8 @@ playback control for Premium users).
    can close it.
 4. In Settings → **Knob bindings**, click **Rebind** next to *Volume up*, turn
    the knob up (or press the key) and repeat for *Volume down* and, if you
-   want, *Mute*. Keys Windows does not name — the knob's OEM codes and the
-   media keys — show up as `Key 0x82`-style names.
+   want, *Mute*. Knobs usually turn out to send a function key above F12, so
+   expect names like `F13`; the defaults are F13 and F15.
 5. Save. Turn the knob: the popup appears and Spotify's volume follows.
 
 ## Settings
@@ -59,10 +59,10 @@ Everything except *transparent* applies immediately on Save.
 | Offline | No network or Spotify unreachable |
 
 Logs: `%APPDATA%\knobify\knobify.log`, rewritten on every start. It records the
-config path, whether a login token is cached, which keyboard hook mode is
-active and where the popup was placed. Set `RUST_LOG=debug` (or
-`RUST_LOG=knobify=trace`) before starting `knobify.exe` for more detail — the
-release build has no console, so the file is the only output.
+config path, whether a login token is cached, whether the keyboard hook was
+installed and where the popup was placed. Set `RUST_LOG=knobify=debug` before
+starting `knobify.exe` for more detail — the release build has no console, so
+the file is the only output.
 
 ## Building
 
@@ -86,10 +86,14 @@ cargo build --release
 cargo test -p knobify-core --target x86_64-unknown-linux-gnu
 ```
 
-Cargo features of the `knobify` crate:
+### Identifying a key
 
-- `listen-only`: use a passive keyboard hook instead of the swallowing one
-  (disables *Swallow bound keys*). Use if the default hook misbehaves.
+Click **Rebind** in Settings and press the key: the row shows what it sent, so
+there is no need to know its code in advance. Many knobs and macro pads send
+the function keys above F12, which is why a knob often shows up as `F13`
+(`0x7C`) rather than something volume-shaped. If the row never changes, that
+key sends no keyboard input at all and nothing built on a keyboard hook can
+bind it.
 
 ## Manual smoke checklist
 
