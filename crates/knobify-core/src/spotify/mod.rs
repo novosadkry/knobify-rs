@@ -37,6 +37,10 @@ pub enum SpotifyCmd {
     SetVolume(u8),
     /// Re-read the current playback state (volume, device).
     Refresh,
+    /// Same read, but a knob tick is waiting for the answer before it sends
+    /// anything, so a device that cannot be controlled must say so rather than
+    /// leave the tick waiting.
+    ReadVolume,
     Login,
     CancelLogin,
     Logout,

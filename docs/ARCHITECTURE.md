@@ -9,7 +9,7 @@ tray icon.
 
 | Crate | Builds on | Contents |
 |---|---|---|
-| `knobify-core` | any host | settings (`config.rs`, `keycode.rs`), `VolumeModel`, `Coalescer`, `AppEvent` vocabulary, the Spotify service (PKCE auth, actor, error mapping) |
+| `knobify-core` | any host | settings (`config.rs`, `keycode.rs`), `VolumeModel`, `Coalescer`, `Readback`, `AppEvent` vocabulary, the Spotify service (PKCE auth, actor, error mapping) |
 | `knobify` (bin) | Windows only | eframe app (`app.rs`), global key hook (`hotkeys.rs`), OSD (`ui/osd.rs`), settings viewport (`ui/settings.rs`), tray (`ui/tray.rs`), Win32 helpers (`win.rs`) |
 
 The bin crate is Windows-only (tray-icon needs GTK on Linux, and the keyboard
@@ -120,9 +120,23 @@ tokio actor     ──┘      send() = tx.send + repaint_of(ROOT)        └─
   120 ms of quiet, re-arms if the target moved during a request, and backs off
   on 429. Reconcile with `current_playback` on login, 1.5 s after a burst, and
   when a burst starts after more than 30 s idle.
-* `Playback` snapshots move `VolumeModel` **only** when the last knob tick is
-  more than 1.5 s old (`BURST_GRACE` in `app.rs`), so a reconcile never yanks
-  the bar while the user is still turning. `VolumeApplied` clears the pending
+* Read-back (`readback.rs`): a knob tick is relative, so it is only as right as
+  the value it is added to, and a volume changed in the Spotify app or on
+  another device would make it jump. `Readback` therefore holds the send of the
+  first tick of a turn while `SpotifyCmd::ReadVolume` reads the device
+  (`DEFAULT_STALE_AFTER` 1 s decides whether the baseline is worth trusting;
+  confirmed sends and adopted snapshots keep it fresh, so the rest of the turn
+  goes out immediately). Ticks that arrive during the wait join the replay and
+  are re-applied on top of the answer, so one read and one PUT carry the whole
+  turn. Because nothing has been sent yet, the reading cannot be an echo of
+  this app's own change, which is what makes replaying it safe. The popup is
+  never held back - it shows the tick at once and corrects itself if the
+  reading disagrees - and `DEFAULT_TIMEOUT` (600 ms) or any Spotify error sends
+  the turn anyway rather than swallowing it.
+* `Playback` snapshots move `VolumeModel` **only** when a read-back is waiting
+  for one, or when the last knob tick is more than 1.5 s old (`BURST_GRACE` in
+  `app.rs`), so a reconcile never yanks the bar while the user is still
+  turning. `VolumeApplied` clears the pending
   marker (the dot on the popup) once the applied value equals the local one.
 * `PlaybackSnapshot::supports_volume == false` disables the volume path: the
   next tick shows "Volume control not allowed" instead of a bar that cannot

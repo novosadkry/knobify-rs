@@ -11,7 +11,8 @@ use knobify_core::spotify::{
     spawn_spotify, AuthState, SpotifyCmd, SpotifyConfig, SpotifyEvent, SpotifyHandle, UserFacing,
 };
 use knobify_core::{
-    AppEvent, BindingTarget, HotkeyAction, KeyCode, Settings, TrayAction, VolumeModel,
+    AppEvent, BindingTarget, HotkeyAction, KeyCode, Readback, Settings, TickPlan, TrayAction,
+    VolumeModel,
 };
 
 use crate::handle::AppHandle;
@@ -37,6 +38,9 @@ pub struct KnobifyApp {
     hotkeys: HotkeyController,
     tray: TrayUi,
     volume: VolumeModel,
+    /// Holds the first tick of a turn while the real volume is read back, so
+    /// a volume changed in Spotify does not make the knob jump.
+    readback: Readback,
     auth: AuthState,
     osd: OsdState,
     settings_ui: Option<Arc<Mutex<SettingsState>>>,
@@ -85,6 +89,7 @@ impl KnobifyApp {
             hotkeys,
             tray,
             volume: VolumeModel::default(),
+            readback: Readback::default(),
             auth: AuthState::LoggedOut,
             osd: OsdState::default(),
             settings_ui: None,
@@ -179,6 +184,75 @@ impl KnobifyApp {
         self.osd.show(content, duration, now);
     }
 
+    /// Apply one knob tick to the volume model.
+    fn step(&mut self, action: HotkeyAction) {
+        let step = self.settings.step;
+        match action {
+            HotkeyAction::VolumeUp => self.volume.step_up(step),
+            HotkeyAction::VolumeDown => self.volume.step_down(step),
+            HotkeyAction::MuteToggle => self.volume.toggle_mute(),
+        };
+    }
+
+    /// A knob tick: show it immediately, then either send it or hold it while
+    /// the current volume is read back from Spotify.
+    ///
+    /// The tick is a relative one ("5% louder"), so it is only as right as the
+    /// value it is added to. When that value may have gone stale - somebody
+    /// moved the slider in the Spotify app, or another device took over - the
+    /// request waits for the truth instead of jumping the volume to it. The
+    /// popup does not wait, because a popup that lags behind the knob feels
+    /// broken; it corrects itself if the reading disagrees.
+    fn on_tick(&mut self, action: HotkeyAction, now: Instant) {
+        self.step(action);
+        self.last_tick = Some(now);
+        // Logged here rather than in the hook, where writing to a file risks
+        // the callback being timed out and the hook destroyed.
+        log::debug!("{action:?} -> {}%", self.volume.local);
+        self.show_volume(now, true);
+
+        match self.readback.on_tick(action, now) {
+            TickPlan::Send => self.spotify.set_volume(self.volume.local),
+            TickPlan::ReadBack => {
+                log::debug!("volume baseline is stale; reading it back before sending");
+                self.spotify.send(SpotifyCmd::ReadVolume);
+            }
+            // The read-back already on its way will carry this tick as well.
+            TickPlan::Wait => {}
+        }
+    }
+
+    /// The reading the held ticks were waiting for: replay them on top of what
+    /// Spotify actually reports and send that.
+    fn apply_readback(&mut self, remote: u8, now: Instant) {
+        let Some(actions) = self.readback.take_replay() else {
+            return;
+        };
+        let shown = (self.volume.local, self.volume.is_muted());
+        self.volume.sync_remote(remote);
+        for action in actions {
+            self.step(action);
+        }
+        if (self.volume.local, self.volume.is_muted()) != shown {
+            log::debug!(
+                "Spotify was at {remote}%: correcting {}% to {}%",
+                shown.0,
+                self.volume.local
+            );
+            self.show_volume(now, true);
+        }
+        self.spotify.set_volume(self.volume.local);
+    }
+
+    /// No reading arrived (offline, no active device, a device that refuses to
+    /// be read): send what the knob asked for rather than swallow the turn.
+    fn abandon_readback(&mut self) {
+        if self.readback.abandon() {
+            log::debug!("no volume reading; sending {}% as asked", self.volume.local);
+            self.spotify.set_volume(self.volume.local);
+        }
+    }
+
     fn handle_event(&mut self, event: AppEvent, ctx: &egui::Context, now: Instant) {
         match event {
             AppEvent::Hotkey(action) => {
@@ -198,18 +272,7 @@ impl KnobifyApp {
                     }
                     return;
                 }
-                let step = self.settings.step;
-                let new_volume = match action {
-                    HotkeyAction::VolumeUp => self.volume.step_up(step),
-                    HotkeyAction::VolumeDown => self.volume.step_down(step),
-                    HotkeyAction::MuteToggle => self.volume.toggle_mute(),
-                };
-                self.last_tick = Some(now);
-                // Logged here rather than in the hook, where writing to a file
-                // risks the callback being timed out and the hook destroyed.
-                log::debug!("{action:?} -> {new_volume}%");
-                self.spotify.set_volume(new_volume);
-                self.show_volume(now, true);
+                self.on_tick(action, now);
             }
             AppEvent::HookFallback(reason) => {
                 log::warn!("key hook unavailable: {reason}");
@@ -249,6 +312,8 @@ impl KnobifyApp {
                     self.device_allows_volume = true;
                     self.last_device_probe = None;
                 }
+                // A volume read from another session is not a baseline.
+                self.readback.set_logged_in(auth.is_logged_in());
                 let for_ui = auth.clone();
                 self.with_settings_ui(ctx, move |s| s.auth = for_ui);
                 // The actor refreshes the playback state itself after a restore
@@ -269,21 +334,37 @@ impl KnobifyApp {
                 }
                 self.device_allows_volume = snapshot.supports_volume;
 
-                // Adopt the device's volume, but never while the knob is being
-                // turned: the popup would jump back and forth. The visible
-                // popup keeps the value it was shown with; only the model moves.
                 let mid_burst = self
                     .last_tick
                     .is_some_and(|at| now.saturating_duration_since(at) < BURST_GRACE);
                 match snapshot.volume {
-                    Some(volume) if !mid_burst => self.volume.sync_remote(volume),
+                    // The reading a held tick asked for. It predates every
+                    // volume this app has sent, so it is the truth even now,
+                    // mid-burst.
+                    Some(volume) if self.readback.is_pending() => {
+                        self.readback.on_synced(now);
+                        self.apply_readback(volume, now);
+                    }
+                    // Otherwise adopt the device's volume, but never while the
+                    // knob is being turned: the popup would jump back and
+                    // forth. The visible popup keeps the value it was shown
+                    // with; only the model moves.
+                    Some(volume) if !mid_burst => {
+                        self.volume.sync_remote(volume);
+                        self.readback.on_synced(now);
+                    }
                     Some(volume) => {
                         log::debug!("keeping the local volume; device reports {volume} mid-burst");
                     }
-                    None => {}
+                    // The device has no volume to report, so a held tick has
+                    // nothing to wait for.
+                    None => self.abandon_readback(),
                 }
             }
             SpotifyEvent::VolumeApplied(volume) => {
+                // Spotify accepted this value, so the device is at it: the
+                // baseline is fresh and the rest of the turn needs no reading.
+                self.readback.on_synced(now);
                 if self.volume.local == volume {
                     // Everything the user asked for has landed: drop the
                     // "pending" dot (and let a snapshot sync the model again).
@@ -295,6 +376,10 @@ impl KnobifyApp {
             }
             SpotifyEvent::Error(error) => {
                 log::warn!("spotify: {error}");
+                // Nothing has been sent while a read-back is held, so this
+                // error is the read-back failing (or Spotify being unusable);
+                // either way the turn should not wait out the timeout.
+                self.abandon_readback();
                 self.show_message(self.error_content(&error), now);
             }
         }
@@ -419,6 +504,13 @@ impl eframe::App for KnobifyApp {
         }
         self.drain_settings_actions(ctx, now);
         self.poll_capture(ctx);
+
+        if self.readback.expired(now) {
+            self.abandon_readback();
+        }
+        if let Some(deadline) = self.readback.deadline() {
+            ctx.request_repaint_after(deadline.saturating_duration_since(now));
+        }
 
         // Only ever place the window while it has something to show: while idle
         // it is parked off-screen (that is what makes it invisible), and moving

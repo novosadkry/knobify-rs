@@ -84,9 +84,9 @@ struct ActorState {
     /// A 401 buys one token refresh + retry per burst.
     auth_retry_used: bool,
     last_error: Option<(UserFacing, Instant)>,
-    /// Set by the first volume command. The UI also sends `Refresh` right
-    /// after a login, and nobody wants "no active device" on the screen
-    /// before they have even touched the knob.
+    /// Set by the first volume command or `ReadVolume`. The UI also sends
+    /// `Refresh` right after a login, and nobody wants "no active device" on
+    /// the screen before they have even touched the knob.
     user_interacted: bool,
 }
 
@@ -176,6 +176,12 @@ impl ActorState {
         match cmd {
             SpotifyCmd::SetVolume(volume) => self.on_local_volume(volume.min(100), itx),
             SpotifyCmd::Refresh => self.refresh(true).await,
+            SpotifyCmd::ReadVolume => {
+                // The knob has been touched even though no volume has been
+                // sent yet, so "no active device" is now worth reporting.
+                self.user_interacted = true;
+                self.refresh(true).await;
+            }
             SpotifyCmd::Login => self.start_login(itx),
             SpotifyCmd::CancelLogin => {
                 if self.cancel_login() {
@@ -944,6 +950,30 @@ mod tests {
         });
 
         handle.send(SpotifyCmd::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn read_volume_reports_a_missing_device_but_refresh_stays_quiet() {
+        // 204: logged in, but nothing is playing anywhere.
+        let api = MockApi::start("204 No Content", "").await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut state, events) = logged_in_state(&api, &dir);
+        let (itx, _irx) = mpsc::unbounded_channel();
+        // As if the app had only just started.
+        state.user_interacted = false;
+
+        // A refresh after a login must not accuse the user of anything.
+        state.handle_cmd(SpotifyCmd::Refresh, &itx).await;
+        assert_eq!(events.lock().expect("events").as_slice(), &[]);
+
+        // A held knob tick is waiting for this answer, so it has to be told
+        // that no answer is coming.
+        state.handle_cmd(SpotifyCmd::ReadVolume, &itx).await;
+        assert_eq!(
+            events.lock().expect("events").as_slice(),
+            &[SpotifyEvent::Error(UserFacing::NoActiveDevice)]
+        );
+        assert_eq!(api.requests().len(), 2, "both commands read the state");
     }
 
     #[test]

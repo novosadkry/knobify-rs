@@ -8,10 +8,12 @@ pub mod coalescer;
 pub mod config;
 pub mod events;
 pub mod keycode;
+pub mod readback;
 pub mod spotify;
 pub mod volume;
 
 pub use config::{Bindings, OsdPosition, OsdSettings, Settings};
 pub use events::{AppEvent, BindingTarget, HotkeyAction, TrayAction};
 pub use keycode::KeyCode;
+pub use readback::{Readback, TickPlan};
 pub use volume::VolumeModel;

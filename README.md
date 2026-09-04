@@ -8,6 +8,10 @@ changes on whatever Spotify device is playing, wherever it is.
   settings window by pressing the key you want.
 - **On-screen popup** like the Windows volume flyout: transparent, click-through,
   always on top, with configurable duration and position.
+- **No jumping**: the knob is a relative control, so before the first tick of a
+  turn Knobify reads the volume back from Spotify. Change it in the Spotify app
+  or on your phone and the next turn continues from there, not from whatever
+  Knobify last remembered.
 - **Spotify login** with PKCE (client ID only, no secret), token cached per user.
 - **Optional key swallowing** so a bound key never reaches Windows or other apps.
 
@@ -102,14 +106,16 @@ Things that can only be checked on a real Windows machine:
 1. Tray icon appears; double-click opens Settings.
 2. Settings → paste Client ID → Log in → browser → "logged in" status.
 3. Turn the knob: popup appears at the configured position, Spotify volume changes, popup hides after the configured duration.
-4. Rebind → press knob → the row shows the new key; Save; the new key works.
-5. Enable *Swallow bound keys* with a media key bound: Windows' own volume no longer changes.
-6. Toggle *transparent* off, restart: popup renders as an opaque dark panel.
-7. Exit from the tray menu quits the process (check Task Manager: no leftover
+4. Change the volume in the Spotify app, then turn the knob: it continues from
+   the value Spotify shows, not from the last value Knobify sent.
+5. Rebind → press knob → the row shows the new key; Save; the new key works.
+6. Enable *Swallow bound keys* with a media key bound: Windows' own volume no longer changes.
+7. Toggle *transparent* off, restart: popup renders as an opaque dark panel.
+8. Exit from the tray menu quits the process (check Task Manager: no leftover
    `knobify.exe`).
-8. The popup window is not in Alt+Tab and never takes focus, and clicks go
+9. The popup window is not in Alt+Tab and never takes focus, and clicks go
    through it to whatever is underneath.
-9. With *transparent* off and Settings open, no dark rectangle is left on the
-   desktop while the popup is idle.
+10. With *transparent* off and Settings open, no dark rectangle is left on the
+    desktop while the popup is idle.
 
 See `docs/ARCHITECTURE.md` for the design.
