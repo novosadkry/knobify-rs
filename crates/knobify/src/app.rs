@@ -276,7 +276,9 @@ impl eframe::App for KnobifyApp {
                 self.osd.needs_reposition = false;
             }
         }
-        self.osd.tick(ctx, now);
+        let keep_visible = self.settings_ui.is_some();
+        self.osd
+            .tick(ctx, frame, &self.settings.osd, keep_visible, now);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
