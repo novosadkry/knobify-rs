@@ -104,6 +104,23 @@ impl SpotifyHandle {
 /// Default backoff used when Spotify does not tell us how long to wait.
 pub const DEFAULT_BACKOFF: Duration = Duration::from_secs(2);
 
+/// Reports a panic in the actor thread to the UI instead of leaving volume
+/// control silently dead. `Drop` runs while the thread unwinds, which is the
+/// only place the panic is observable without a `JoinHandle` (nobody joins the
+/// actor thread: the process exit tears it down).
+struct PanicGuard(EventSink);
+
+impl Drop for PanicGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            log::error!("the Spotify actor thread panicked");
+            (self.0)(SpotifyEvent::Error(UserFacing::Other(
+                "Spotify service crashed, restart Knobify".to_owned(),
+            )));
+        }
+    }
+}
+
 /// Start the Spotify actor on its own thread with a current-thread tokio
 /// runtime. Returns immediately.
 pub fn spawn_spotify(cfg: SpotifyConfig, sink: EventSink) -> SpotifyHandle {
@@ -112,6 +129,7 @@ pub fn spawn_spotify(cfg: SpotifyConfig, sink: EventSink) -> SpotifyHandle {
     let spawned = std::thread::Builder::new()
         .name("knobify-spotify".into())
         .spawn(move || {
+            let _guard = PanicGuard(Arc::clone(&thread_sink));
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

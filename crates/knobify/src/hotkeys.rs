@@ -19,7 +19,7 @@ use std::cell::Cell;
 use std::sync::{Arc, Mutex, RwLock};
 
 use knobify_core::events::match_key;
-use knobify_core::{AppEvent, Bindings, BindingTarget, KeyCode};
+use knobify_core::{AppEvent, BindingTarget, Bindings, KeyCode};
 
 use crate::handle::AppHandle;
 
@@ -53,18 +53,6 @@ impl HotkeyController {
             *guard = None;
         }
     }
-
-    /// Not yet called from `app.rs` (reserved for a future settings-UI
-    /// affordance, e.g. disabling other controls while capturing); part of
-    /// the WP2 public API contract, exercised directly by this module's tests.
-    #[allow(dead_code)]
-    pub fn is_capturing(&self) -> bool {
-        self.shared
-            .capture
-            .lock()
-            .map(|g| g.is_some())
-            .unwrap_or(false)
-    }
 }
 
 /// Start the hook thread. Never returns on its own; the process exit tears it down.
@@ -76,10 +64,16 @@ pub fn spawn_hotkey_thread(initial: Bindings, out: AppHandle) -> HotkeyControlle
     let controller = HotkeyController {
         shared: Arc::clone(&shared),
     };
-    std::thread::Builder::new()
+    // Nothing joins this thread: `rdev` has no stop API, the callback blocks in
+    // `GetMessageA` forever and the process exit tears it down.
+    if let Err(e) = std::thread::Builder::new()
         .name("knobify-hotkeys".into())
         .spawn(move || run_hook(shared, out))
-        .expect("spawning the hotkey thread cannot fail on Windows");
+    {
+        // The knob is dead, but the tray, Settings and the OSD still work, so
+        // stay up and say why.
+        log::error!("cannot start the hotkey thread ({e}); bound keys will not work");
+    }
     controller
 }
 
@@ -187,6 +181,7 @@ fn run_hook(shared: Arc<HotkeyShared>, out: AppHandle) {
 
     #[cfg(not(feature = "listen-only"))]
     {
+        log::info!("global key hook: grab mode (bound keys can be swallowed)");
         run_grab(shared, out);
     }
 }
@@ -221,12 +216,15 @@ fn run_listen(shared: Arc<HotkeyShared>, out: AppHandle) {
     let swallow_release = Cell::new(None);
     let callback = move |event: rdev::Event| {
         let decision = decide(&shared, &swallow_release, &event);
+        if decision.swallow {
+            // `listen` only observes; the key reaches Windows anyway.
+            log::trace!("cannot swallow {:?} in listen mode", event.event_type);
+        }
         if let Some(app_event) = decision.emit {
             out.send(app_event);
         }
-        // `listen` cannot swallow events; `decision.swallow` only matters for
-        // the release-tracking state above.
     };
+    log::info!("global key hook: listen mode (key suppression unavailable)");
     if let Err(e) = rdev::listen(callback) {
         log::error!("rdev::listen failed to install the low-level hooks: {e:?}");
     }
@@ -409,10 +407,7 @@ mod tests {
         }
 
         let received = rx.try_recv().expect("expected an emitted AppEvent");
-        assert!(matches!(
-            received,
-            AppEvent::Hotkey(HotkeyAction::VolumeUp)
-        ));
+        assert!(matches!(received, AppEvent::Hotkey(HotkeyAction::VolumeUp)));
     }
 
     #[test]
@@ -424,16 +419,90 @@ mod tests {
         );
     }
 
+    /// Named keys are stored as `format!("{key:?}")`, and `KeyCode::from_str`
+    /// only accepts ASCII alphanumerics, so a `Debug` name with a space or a
+    /// symbol in it would write a config file that cannot be read back. rdev
+    /// 0.5.3 has no such variant; this covers every naming shape it does have
+    /// (and `Unknown`, which never goes through the name path).
+    #[test]
+    fn every_key_name_round_trips_through_the_config_form() {
+        use std::str::FromStr as _;
+
+        let keys = [
+            rdev::Key::Alt,
+            rdev::Key::AltGr,
+            rdev::Key::BackQuote,
+            rdev::Key::BackSlash,
+            rdev::Key::Backspace,
+            rdev::Key::CapsLock,
+            rdev::Key::Comma,
+            rdev::Key::ControlLeft,
+            rdev::Key::Delete,
+            rdev::Key::Dot,
+            rdev::Key::DownArrow,
+            rdev::Key::Equal,
+            rdev::Key::Escape,
+            rdev::Key::F12,
+            rdev::Key::Function,
+            rdev::Key::Insert,
+            rdev::Key::IntlBackslash,
+            rdev::Key::KeyA,
+            rdev::Key::Kp0,
+            rdev::Key::KpDelete,
+            rdev::Key::KpDivide,
+            rdev::Key::KpMinus,
+            rdev::Key::KpMultiply,
+            rdev::Key::KpPlus,
+            rdev::Key::KpReturn,
+            rdev::Key::LeftBracket,
+            rdev::Key::MetaLeft,
+            rdev::Key::Minus,
+            rdev::Key::Num0,
+            rdev::Key::NumLock,
+            rdev::Key::PageDown,
+            rdev::Key::Pause,
+            rdev::Key::PrintScreen,
+            rdev::Key::Quote,
+            rdev::Key::Return,
+            rdev::Key::ScrollLock,
+            rdev::Key::SemiColon,
+            rdev::Key::ShiftLeft,
+            rdev::Key::Slash,
+            rdev::Key::Space,
+            rdev::Key::Tab,
+            rdev::Key::UpArrow,
+            // Media keys are `Unknown` in rdev 0.5.3 (0xAD is VK_VOLUME_MUTE).
+            rdev::Key::Unknown(0xAD),
+        ];
+
+        for key in keys {
+            let code = key_to_keycode(key);
+            let text = code.to_config_string();
+            let parsed = KeyCode::from_str(&text)
+                .unwrap_or_else(|e| panic!("{key:?} -> {text:?} does not parse back: {e}"));
+            assert_eq!(parsed, code, "{key:?} did not round-trip");
+        }
+    }
+
     #[test]
     fn controller_bindings_and_capture_round_trip() {
         let (handle, _rx) = AppHandle::new(egui::Context::default());
         let controller = spawn_disabled_controller();
 
-        assert!(!controller.is_capturing());
+        let capturing = || {
+            controller
+                .shared
+                .capture
+                .lock()
+                .map(|guard| *guard)
+                .unwrap_or(None)
+        };
+
+        assert_eq!(capturing(), None);
         controller.begin_capture(BindingTarget::VolumeUp);
-        assert!(controller.is_capturing());
+        assert_eq!(capturing(), Some(BindingTarget::VolumeUp));
         controller.cancel_capture();
-        assert!(!controller.is_capturing());
+        assert_eq!(capturing(), None);
 
         let bindings = Bindings {
             volume_up: KeyCode::named("Function"),

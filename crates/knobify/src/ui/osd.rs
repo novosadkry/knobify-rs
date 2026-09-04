@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::{
-    Align2, Color32, FontId, Galley, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2, pos2, vec2,
+    pos2, vec2, Align2, Color32, FontId, Galley, Pos2, Rect, Shape, Stroke, StrokeKind, Vec2,
 };
 use knobify_core::spotify::UserFacing;
 use knobify_core::{OsdPosition, OsdSettings};
@@ -33,6 +33,10 @@ const SHADOW_PAD: f32 = 7.0;
 const CORNER: f32 = 12.0;
 /// Horizontal padding inside the panel.
 const PAD_X: f32 = 14.0;
+
+/// Where the opaque fallback parks the root window while it has nothing to
+/// paint but must stay mapped (Settings open). Far outside any desktop.
+const PARKED_POS: Pos2 = pos2(-32000.0, -32000.0);
 
 const FADE_IN: Duration = Duration::from_millis(120);
 const FADE_OUT: Duration = Duration::from_millis(150);
@@ -48,8 +52,16 @@ const ACCENT_MUTED: Color32 = Color32::from_rgb(130, 130, 130);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum OsdContent {
-    Volume { percent: u8, muted: bool, pending: bool },
-    Message { title: String, detail: String, kind: MsgKind },
+    Volume {
+        percent: u8,
+        muted: bool,
+        pending: bool,
+    },
+    Message {
+        title: String,
+        detail: String,
+        kind: MsgKind,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +94,9 @@ impl From<&UserFacing> for OsdContent {
         let kind = match e {
             // Not a failure, just something the user has to do first.
             UserFacing::NotLoggedIn => MsgKind::Info,
-            UserFacing::RateLimited { .. } | UserFacing::NoActiveDevice => MsgKind::Warning,
+            UserFacing::RateLimited { .. }
+            | UserFacing::NoActiveDevice
+            | UserFacing::VolumeControlNotAllowed => MsgKind::Warning,
             _ => MsgKind::Error,
         };
         OsdContent::Message {
@@ -112,6 +126,9 @@ pub struct OsdState {
     /// Passes seen so far, saturating at 2. eframe keeps the root window hidden
     /// until it has painted once, so we must not fight it on the first pass.
     passes: u8,
+    /// Opaque fallback only: the window is mapped just so the Settings viewport
+    /// can exist, and has been moved off-screen because it has nothing to show.
+    parked: bool,
 }
 
 impl Default for OsdState {
@@ -128,6 +145,7 @@ impl Default for OsdState {
             window_shown: true,
             restyle_pending: false,
             passes: 0,
+            parked: false,
         }
     }
 }
@@ -258,21 +276,39 @@ impl OsdState {
             return;
         }
 
-        let want = keep_visible || self.hide_at.is_some();
-        if want == self.window_shown {
-            return;
-        }
-        if !want && self.passes < 2 {
-            // eframe unhides the root only after its first painted frame; a
-            // Visible(false) sent before that would be undone right away.
-            return;
+        let showing = self.hide_at.is_some();
+        let want = keep_visible || showing;
+        if want != self.window_shown {
+            if !want && self.passes < 2 {
+                // eframe unhides the root only after its first painted frame; a
+                // `Visible(false)` sent before that would be undone right away.
+                // Nothing else asks for a repaint at startup, so ask here or the
+                // empty dark window would stay up until the first hotkey.
+                ctx.request_repaint();
+                return;
+            }
+            self.window_shown = want;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(want));
+            if want {
+                self.needs_reposition = true;
+                self.restyle_pending = true;
+            }
         }
 
-        self.window_shown = want;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(want));
-        if want {
+        if want && !showing {
+            // Mapped only so the Settings viewport can be created: an opaque
+            // window paints a dark rectangle even with nothing in it, so move it
+            // out of sight instead of leaving it on top of the desktop. The real
+            // position is recomputed when the popup shows again.
+            self.needs_reposition = false;
+            if !self.parked {
+                self.parked = true;
+                log::debug!("parking the opaque popup off-screen while it has nothing to show");
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(PARKED_POS));
+            }
+        } else if self.parked {
+            self.parked = false;
             self.needs_reposition = true;
-            self.restyle_pending = true;
         }
     }
 }
@@ -293,7 +329,7 @@ pub fn root_viewport_builder(osd: &OsdSettings) -> egui::ViewportBuilder {
         // the first painted frame, in both modes. Asking for `true` keeps the
         // intent explicit and matches what the window ends up as.
         .with_visible(true);
-    if let Ok(icon) = crate::icon::egui_icon() {
+    if let Some(icon) = crate::icon::egui_icon() {
         builder = builder.with_icon(icon);
     }
     builder
@@ -323,19 +359,52 @@ pub fn compute_position(
     }
 
     // The work area excludes the taskbar; fall back to the whole monitor.
-    let work = crate::win::primary_work_area().unwrap_or_else(|| {
-        let origin = monitor.position();
-        let size = monitor.size();
-        crate::win::Rect {
-            left: origin.x,
-            top: origin.y,
-            right: origin.x.saturating_add(size.width as i32),
-            bottom: origin.y.saturating_add(size.height as i32),
+    let (work, source) = match crate::win::primary_work_area() {
+        Some(work) => (work, "SPI_GETWORKAREA"),
+        None => {
+            let origin = monitor.position();
+            let size = monitor.size();
+            (
+                crate::win::Rect {
+                    left: origin.x,
+                    top: origin.y,
+                    right: origin.x.saturating_add(size.width as i32),
+                    bottom: origin.y.saturating_add(size.height as i32),
+                },
+                "monitor bounds",
+            )
         }
-    });
+    };
 
-    Some(place(work, OSD_SIZE, osd.margin, ppp, osd.position))
+    let at = place(work, OSD_SIZE, osd.margin, ppp, osd.position);
+
+    // The first placement of a session is worth an info line; the repeats (one
+    // per popup, in case the monitor layout changed) are debug noise.
+    let mut first = false;
+    PLACEMENT_LOGGED.call_once(|| first = true);
+    log::log!(
+        if first {
+            log::Level::Info
+        } else {
+            log::Level::Debug
+        },
+        "popup placement: {:?}, margin {} pt, work area {}x{}+{}+{} px from {source}, \
+         ppp {ppp} -> ({}, {}) pt",
+        osd.position,
+        osd.margin,
+        work.width(),
+        work.height(),
+        work.left,
+        work.top,
+        at.x,
+        at.y,
+    );
+
+    Some(at)
 }
+
+/// Guards the one info-level placement line per process.
+static PLACEMENT_LOGGED: std::sync::Once = std::sync::Once::new();
 
 /// Pure layout math: place an `size_pt` box inside the physical-pixel rectangle
 /// `work`, `margin_pt` points away from the edges `position` names, and return

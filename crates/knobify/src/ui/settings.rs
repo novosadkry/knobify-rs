@@ -18,6 +18,13 @@ const MAX_REDIRECT_PORT: u16 = 65535;
 const MAX_OSD_MARGIN: f32 = 400.0;
 
 const ERROR_COLOR: egui::Color32 = egui::Color32::from_rgb(224, 90, 90);
+const HINT_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 170, 240);
+
+/// Status line on first run, when no client ID has been entered yet.
+pub const SETUP_HINT: &str = "Paste your Spotify Client ID, then Log in.";
+/// The longer version, wrapped inside the Spotify section.
+const SETUP_STEPS: &str = "First run: create an app at developer.spotify.com/dashboard, \
+     register the redirect URI below in it, then paste its Client ID here.";
 
 pub fn viewport_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("knobify-settings")
@@ -29,7 +36,7 @@ pub fn viewport_builder() -> egui::ViewportBuilder {
         .with_inner_size([440.0, 560.0])
         .with_min_inner_size([380.0, 420.0])
         .with_resizable(true);
-    if let Ok(icon) = crate::icon::egui_icon() {
+    if let Some(icon) = crate::icon::egui_icon() {
         builder = builder.with_icon(icon);
     }
     builder
@@ -60,21 +67,39 @@ pub struct SettingsState {
     pub auth: AuthState,
     /// `true` when the hook fell back to listen mode (suppression impossible).
     pub suppress_unavailable: bool,
+    /// One line under the buttons: a save error, a confirmation, or the
+    /// first-run hint. Cleared as soon as the user edits anything.
     pub status_line: Option<String>,
+    /// Paint [`Self::status_line`] as an error rather than a hint.
+    pub status_is_error: bool,
     pub actions: Vec<SettingsAction>,
 }
 
 impl SettingsState {
     pub fn new(current: &Settings, auth: AuthState) -> Self {
+        let needs_setup = current.client_id.trim().is_empty();
         Self {
             draft: current.clone(),
             saved: current.clone(),
             capture: None,
             auth,
             suppress_unavailable: false,
-            status_line: None,
+            status_line: needs_setup.then(|| SETUP_HINT.to_owned()),
+            status_is_error: false,
             actions: Vec::new(),
         }
+    }
+
+    /// Report a failure under the buttons.
+    pub fn set_error(&mut self, message: impl Into<String>) {
+        self.status_line = Some(message.into());
+        self.status_is_error = true;
+    }
+
+    /// Report a non-failure (a confirmation, a hint) under the buttons.
+    pub fn set_hint(&mut self, message: impl Into<String>) {
+        self.status_line = Some(message.into());
+        self.status_is_error = false;
     }
 }
 
@@ -82,6 +107,7 @@ impl SettingsState {
 pub fn show(ui: &mut egui::Ui, state: &Arc<Mutex<SettingsState>>) {
     let Ok(mut guard) = state.lock() else { return };
     let state = &mut *guard;
+    let queued = state.actions.len();
 
     if ui.ctx().input(|i| i.viewport().close_requested()) {
         state.actions.push(SettingsAction::Close);
@@ -108,11 +134,23 @@ pub fn show(ui: &mut egui::Ui, state: &Arc<Mutex<SettingsState>>) {
 
     ui.separator();
     show_bottom_bar(ui, state);
+
+    if state.actions.len() != queued {
+        // Only the root viewport runs `App::logic`, which is what executes
+        // these actions; repainting this viewport alone would leave every
+        // button dead until something else woke the root.
+        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+    }
 }
 
 fn show_spotify_section(ui: &mut egui::Ui, state: &mut SettingsState) {
     ui.heading("Spotify");
     ui.group(|ui| {
+        if state.draft.client_id.trim().is_empty() {
+            ui.label(egui::RichText::new(SETUP_STEPS).color(HINT_COLOR).small());
+            ui.add_space(4.0);
+        }
+
         match state.auth.clone() {
             AuthState::LoggedOut => {
                 ui.label("Status: logged out.");
@@ -349,10 +387,12 @@ fn show_bottom_bar(ui: &mut egui::Ui, state: &mut SettingsState) {
     ui.horizontal(|ui| {
         let dirty = state.draft != state.saved;
         if ui.add_enabled(dirty, egui::Button::new("Save")).clicked() {
+            // `App::apply_settings` writes the file and then puts the sanitized
+            // settings back into `draft`/`saved`, so a failed save leaves the
+            // Save button enabled.
             state
                 .actions
                 .push(SettingsAction::Save(state.draft.clone()));
-            state.saved = state.draft.clone();
         }
         if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
             state.draft = state.saved.clone();
@@ -362,7 +402,12 @@ fn show_bottom_bar(ui: &mut egui::Ui, state: &mut SettingsState) {
             state.actions.push(SettingsAction::Close);
         }
         if let Some(status) = &state.status_line {
-            ui.colored_label(ERROR_COLOR, status);
+            let color = if state.status_is_error {
+                ERROR_COLOR
+            } else {
+                HINT_COLOR
+            };
+            ui.label(egui::RichText::new(status).color(color).small());
         }
     });
 }
@@ -391,6 +436,30 @@ mod tests {
 
         let raw = Some(KeyCode::raw(0x82));
         assert_eq!(optional_binding_label(&raw), "Key 0x82");
+    }
+
+    #[test]
+    fn a_missing_client_id_shows_the_setup_hint_not_an_error() {
+        let state = SettingsState::new(&Settings::default(), AuthState::LoggedOut);
+        assert_eq!(state.status_line.as_deref(), Some(SETUP_HINT));
+        assert!(!state.status_is_error);
+
+        let configured = Settings {
+            client_id: "abc123".to_owned(),
+            ..Settings::default()
+        };
+        let state = SettingsState::new(&configured, AuthState::LoggedOut);
+        assert_eq!(state.status_line, None);
+    }
+
+    #[test]
+    fn set_error_and_set_hint_pick_the_colour() {
+        let mut state = SettingsState::new(&Settings::default(), AuthState::LoggedOut);
+        state.set_error("Could not save: nope");
+        assert!(state.status_is_error);
+        state.set_hint("Saved.");
+        assert!(!state.status_is_error);
+        assert_eq!(state.status_line.as_deref(), Some("Saved."));
     }
 
     #[test]

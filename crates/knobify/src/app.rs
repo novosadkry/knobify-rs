@@ -8,21 +8,29 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use knobify_core::config;
 use knobify_core::spotify::{
-    spawn_spotify, AuthState, SpotifyCmd, SpotifyConfig, SpotifyEvent, SpotifyHandle,
+    spawn_spotify, AuthState, SpotifyCmd, SpotifyConfig, SpotifyEvent, SpotifyHandle, UserFacing,
 };
-use knobify_core::{AppEvent, HotkeyAction, Settings, TrayAction, VolumeModel};
+use knobify_core::{AppEvent, BindingTarget, HotkeyAction, Settings, TrayAction, VolumeModel};
 
 use crate::handle::AppHandle;
 use crate::hotkeys::{spawn_hotkey_thread, HotkeyController};
-use crate::ui::osd::{self, OsdContent, OsdState};
+use crate::ui::osd::{self, MsgKind, OsdContent, OsdState};
 use crate::ui::settings::{self, SettingsAction, SettingsState};
 use crate::ui::tray::TrayUi;
+
+/// A knob tick less than this ago means the user is still turning the knob, so
+/// a playback snapshot must not move the bar under their fingers. The actor
+/// reconciles 1.5 s after the last accepted PUT, i.e. just outside this window.
+const BURST_GRACE: Duration = Duration::from_millis(1500);
+
+/// How often a tick on a device that refuses volume control may re-read the
+/// playback state to find out whether that is still true.
+const DEVICE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct KnobifyApp {
     settings: Settings,
     cfg_path: PathBuf,
     rx: mpsc::Receiver<AppEvent>,
-    handle: AppHandle,
     spotify: SpotifyHandle,
     hotkeys: HotkeyController,
     tray: TrayUi,
@@ -31,7 +39,18 @@ pub struct KnobifyApp {
     osd: OsdState,
     settings_ui: Option<Arc<Mutex<SettingsState>>>,
     suppress_unavailable: bool,
-    first_frame_done: bool,
+    /// When the last knob tick happened (see [`BURST_GRACE`]).
+    last_tick: Option<Instant>,
+    /// False once a playback snapshot reported a device that refuses remote
+    /// volume changes; the next tick then explains that instead of moving a bar
+    /// that cannot move.
+    device_allows_volume: bool,
+    /// Last time a blocked tick asked for a fresh playback snapshot.
+    last_device_probe: Option<Instant>,
+    /// How many passes have re-applied the popup window's extended styles.
+    /// eframe unhides the root right after its first painted frame and winit
+    /// rewrites the whole `GWL_EXSTYLE` word when it does, so once is not enough.
+    styled_passes: u8,
 }
 
 impl KnobifyApp {
@@ -43,24 +62,23 @@ impl KnobifyApp {
         let (handle, rx) = AppHandle::new(cc.egui_ctx.clone());
 
         let tray = TrayUi::new(handle.clone()).context("creating the tray icon")?;
+        tray.set_state(&AuthState::LoggedOut, !settings.client_id.trim().is_empty());
         let hotkeys = spawn_hotkey_thread(settings.bindings.clone(), handle.clone());
 
         let cache_path = config::token_cache_path().context("locating the token cache")?;
-        let sink_handle = handle.clone();
         let spotify = spawn_spotify(
             SpotifyConfig {
                 client_id: settings.client_id.clone(),
                 redirect_port: settings.redirect_port,
                 cache_path,
             },
-            Arc::new(move |event| sink_handle.send_spotify(event)),
+            Arc::new(move |event| handle.send_spotify(event)),
         );
 
         Ok(Self {
             settings,
             cfg_path,
             rx,
-            handle,
             spotify,
             hotkeys,
             tray,
@@ -69,8 +87,29 @@ impl KnobifyApp {
             osd: OsdState::default(),
             settings_ui: None,
             suppress_unavailable: false,
-            first_frame_done: false,
+            last_tick: None,
+            device_allows_volume: true,
+            last_device_probe: None,
+            styled_passes: 0,
         })
+    }
+
+    /// No Spotify client ID yet: nothing can work until the user visits Settings.
+    fn needs_setup(&self) -> bool {
+        self.settings.client_id.trim().is_empty()
+    }
+
+    /// Edit the settings window's shared state (if it is open) and repaint it.
+    fn with_settings_ui(&self, ctx: &egui::Context, edit: impl FnOnce(&mut SettingsState)) {
+        let Some(state) = &self.settings_ui else {
+            return;
+        };
+        match state.lock() {
+            Ok(mut guard) => edit(&mut guard),
+            Err(_) => return,
+        }
+        // The settings window is a child viewport with its own repaint schedule.
+        ctx.request_repaint_of(settings::viewport_id());
     }
 
     fn osd_duration(&self) -> Duration {
@@ -102,92 +141,150 @@ impl KnobifyApp {
     fn handle_event(&mut self, event: AppEvent, ctx: &egui::Context, now: Instant) {
         match event {
             AppEvent::Hotkey(action) => {
+                if !self.device_allows_volume {
+                    // Nothing to send: this device rejects remote volume changes.
+                    log::debug!("ignoring {action:?}: the active device disallows volume control");
+                    self.show_message(OsdContent::from(&UserFacing::VolumeControlNotAllowed), now);
+                    // The user may meanwhile have switched to a device that does
+                    // allow it, so re-read the playback state now and then; the
+                    // snapshot clears this flag again.
+                    let due = self.last_device_probe.is_none_or(|at| {
+                        now.saturating_duration_since(at) >= DEVICE_PROBE_INTERVAL
+                    });
+                    if due {
+                        self.last_device_probe = Some(now);
+                        self.spotify.send(SpotifyCmd::Refresh);
+                    }
+                    return;
+                }
                 let step = self.settings.step;
                 let new_volume = match action {
                     HotkeyAction::VolumeUp => self.volume.step_up(step),
                     HotkeyAction::VolumeDown => self.volume.step_down(step),
                     HotkeyAction::MuteToggle => self.volume.toggle_mute(),
                 };
+                self.last_tick = Some(now);
                 self.spotify.set_volume(new_volume);
                 self.show_volume(now, true);
             }
             AppEvent::KeyCaptured { target, key } => {
+                // The hook clears its own one-shot capture flag; this covers the
+                // `listen` fallback, where the event may arrive more than once.
                 self.hotkeys.cancel_capture();
-                if let Some(state) = &self.settings_ui {
-                    if let Ok(mut s) = state.lock() {
-                        match target {
-                            knobify_core::BindingTarget::VolumeUp => s.draft.bindings.volume_up = key,
-                            knobify_core::BindingTarget::VolumeDown => {
-                                s.draft.bindings.volume_down = key
-                            }
-                            knobify_core::BindingTarget::Mute => s.draft.bindings.mute = Some(key),
-                        }
-                        s.capture = None;
+                self.with_settings_ui(ctx, |s| {
+                    match target {
+                        BindingTarget::VolumeUp => s.draft.bindings.volume_up = key,
+                        BindingTarget::VolumeDown => s.draft.bindings.volume_down = key,
+                        BindingTarget::Mute => s.draft.bindings.mute = Some(key),
                     }
-                }
+                    s.capture = None;
+                });
             }
             AppEvent::CaptureCancelled => {
                 self.hotkeys.cancel_capture();
-                if let Some(state) = &self.settings_ui {
-                    if let Ok(mut s) = state.lock() {
-                        s.capture = None;
-                    }
-                }
+                self.with_settings_ui(ctx, |s| s.capture = None);
             }
             AppEvent::HookFallback(reason) => {
                 log::warn!("key hook fallback: {reason}");
                 self.suppress_unavailable = true;
-                if let Some(state) = &self.settings_ui {
-                    if let Ok(mut s) = state.lock() {
-                        s.suppress_unavailable = true;
-                    }
-                }
+                self.with_settings_ui(ctx, |s| s.suppress_unavailable = true);
             }
             AppEvent::Tray(TrayAction::OpenSettings) => self.open_settings(),
             AppEvent::Tray(TrayAction::LoginOrLogout) => {
-                if self.auth.is_logged_in() {
+                if self.needs_setup() {
+                    // The tray item reads "Set up Spotify…" in this state.
+                    self.open_settings();
+                } else if self.auth.is_logged_in() {
                     self.spotify.send(SpotifyCmd::Logout);
                 } else {
                     self.spotify.send(SpotifyCmd::Login);
                 }
             }
             AppEvent::Tray(TrayAction::Exit) => {
+                log::info!("exit requested from the tray");
                 self.spotify.send(SpotifyCmd::Shutdown);
+                // Closing the root viewport ends `run_native`, and returning
+                // from `main` ends the process (the hook thread is never
+                // joined: it blocks in `GetMessageA` forever).
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            AppEvent::Spotify(event) => self.handle_spotify(event, now),
+            AppEvent::Spotify(event) => self.handle_spotify(event, ctx, now),
         }
     }
 
-    fn handle_spotify(&mut self, event: SpotifyEvent, now: Instant) {
+    fn handle_spotify(&mut self, event: SpotifyEvent, ctx: &egui::Context, now: Instant) {
         match event {
             SpotifyEvent::Auth(auth) => {
-                self.tray.set_auth(&auth);
-                if let Some(state) = &self.settings_ui {
-                    if let Ok(mut s) = state.lock() {
-                        s.auth = auth.clone();
-                    }
+                self.tray.set_state(&auth, !self.needs_setup());
+                if !auth.is_logged_in() {
+                    // Whatever the last device allowed is no longer relevant;
+                    // ticks should report the login state instead.
+                    self.device_allows_volume = true;
+                    self.last_device_probe = None;
                 }
-                if auth.is_logged_in() {
-                    self.spotify.send(SpotifyCmd::Refresh);
-                }
+                let for_ui = auth.clone();
+                self.with_settings_ui(ctx, move |s| s.auth = for_ui);
+                // The actor refreshes the playback state itself after a restore
+                // or a login; asking again here would only double every request.
                 self.auth = auth;
             }
             SpotifyEvent::Playback(snapshot) => {
-                if let Some(volume) = snapshot.volume {
-                    self.volume.sync_remote(volume);
+                if self.device_allows_volume != snapshot.supports_volume {
+                    log::info!(
+                        "device {:?}: volume control {}",
+                        snapshot.device_name,
+                        if snapshot.supports_volume {
+                            "available"
+                        } else {
+                            "not allowed"
+                        }
+                    );
+                }
+                self.device_allows_volume = snapshot.supports_volume;
+
+                // Adopt the device's volume, but never while the knob is being
+                // turned: the popup would jump back and forth. The visible
+                // popup keeps the value it was shown with; only the model moves.
+                let mid_burst = self
+                    .last_tick
+                    .is_some_and(|at| now.saturating_duration_since(at) < BURST_GRACE);
+                match snapshot.volume {
+                    Some(volume) if !mid_burst => self.volume.sync_remote(volume),
+                    Some(volume) => {
+                        log::debug!("keeping the local volume; device reports {volume} mid-burst");
+                    }
+                    None => {}
                 }
             }
             SpotifyEvent::VolumeApplied(volume) => {
-                if self.osd.is_visible(now) && self.volume.local == volume {
-                    self.show_volume(now, false);
+                if self.volume.local == volume {
+                    // Everything the user asked for has landed: drop the
+                    // "pending" dot (and let a snapshot sync the model again).
+                    self.last_tick = None;
+                    if self.osd.is_visible(now) {
+                        self.show_volume(now, false);
+                    }
                 }
             }
             SpotifyEvent::Error(error) => {
-                log::warn!("spotify: {error:?}");
-                self.show_message(OsdContent::from(&error), now);
+                log::warn!("spotify: {error}");
+                self.show_message(self.error_content(&error), now);
             }
         }
+    }
+
+    /// Popup content for a Spotify error. The very first run has no client ID
+    /// yet, which is not a failure but a setup step, so it gets its own
+    /// info-styled message pointing at Settings.
+    fn error_content(&self, error: &UserFacing) -> OsdContent {
+        if self.needs_setup() && matches!(error, UserFacing::LoginFailed(_)) {
+            return OsdContent::Message {
+                title: "Set up Spotify".to_owned(),
+                detail: "Open Settings from the tray and paste your Spotify client ID".to_owned(),
+                kind: MsgKind::Info,
+            };
+        }
+        OsdContent::from(error)
     }
 
     fn open_settings(&mut self) {
@@ -198,41 +295,46 @@ impl KnobifyApp {
         }
     }
 
-    fn drain_settings_actions(&mut self, now: Instant) {
-        let Some(state) = self.settings_ui.clone() else { return };
+    fn drain_settings_actions(&mut self, ctx: &egui::Context, now: Instant) {
+        let Some(state) = self.settings_ui.clone() else {
+            return;
+        };
         let actions: Vec<SettingsAction> = match state.lock() {
             Ok(mut s) => std::mem::take(&mut s.actions),
             Err(_) => return,
         };
         for action in actions {
             match action {
-                SettingsAction::Save(new_settings) => self.apply_settings(new_settings.sanitized()),
+                SettingsAction::Save(new_settings) => {
+                    self.apply_settings(new_settings.sanitized(), ctx);
+                }
                 SettingsAction::Login => self.spotify.send(SpotifyCmd::Login),
                 SettingsAction::CancelLogin => self.spotify.send(SpotifyCmd::CancelLogin),
                 SettingsAction::Logout => self.spotify.send(SpotifyCmd::Logout),
                 SettingsAction::Capture(target) => {
                     self.hotkeys.begin_capture(target);
-                    if let Ok(mut s) = state.lock() {
-                        s.capture = Some(target);
-                    }
+                    self.with_settings_ui(ctx, |s| s.capture = Some(target));
                 }
                 SettingsAction::CancelCapture => {
                     self.hotkeys.cancel_capture();
-                    if let Ok(mut s) = state.lock() {
-                        s.capture = None;
-                    }
+                    self.with_settings_ui(ctx, |s| s.capture = None);
                 }
                 SettingsAction::PreviewOsd => self.show_volume(now, false),
                 SettingsAction::Close => {
+                    // Covers both the Close button and the window's X: the
+                    // capture must not outlive the window that started it.
                     self.hotkeys.cancel_capture();
+                    // Not showing the deferred viewport in `App::ui` closes it.
                     self.settings_ui = None;
                 }
             }
         }
     }
 
-    fn apply_settings(&mut self, new_settings: Settings) {
-        if new_settings.client_id != self.settings.client_id {
+    /// Persist and apply already-sanitized settings.
+    fn apply_settings(&mut self, new_settings: Settings, ctx: &egui::Context) {
+        let client_id_changed = new_settings.client_id != self.settings.client_id;
+        if client_id_changed {
             self.spotify
                 .send(SpotifyCmd::SetClientId(new_settings.client_id.clone()));
         }
@@ -244,20 +346,32 @@ impl KnobifyApp {
             self.hotkeys.set_bindings(new_settings.bindings.clone());
         }
         if new_settings.osd != self.settings.osd {
+            // Position, margin and the popup size all feed the placement.
             self.osd.needs_reposition = true;
         }
-        match config::save(&self.cfg_path, &new_settings) {
-            Ok(()) => log::info!("settings saved to {}", self.cfg_path.display()),
+        let saved = config::save(&self.cfg_path, &new_settings);
+        self.settings = new_settings;
+        if client_id_changed {
+            self.tray.set_state(&self.auth, !self.needs_setup());
+        }
+
+        let settings_copy = self.settings.clone();
+        match saved {
+            Ok(()) => {
+                log::info!("settings saved to {}", self.cfg_path.display());
+                self.with_settings_ui(ctx, move |s| {
+                    // The file holds the sanitized values, so the window must
+                    // show them too (and stop offering Save for a no-op).
+                    s.draft = settings_copy.clone();
+                    s.saved = settings_copy;
+                    s.set_hint("Saved.");
+                });
+            }
             Err(e) => {
                 log::error!("{e}");
-                if let Some(state) = &self.settings_ui {
-                    if let Ok(mut s) = state.lock() {
-                        s.status_line = Some(format!("Could not save: {e}"));
-                    }
-                }
+                self.with_settings_ui(ctx, move |s| s.set_error(format!("Could not save: {e}")));
             }
         }
-        self.settings = new_settings;
     }
 }
 
@@ -268,7 +382,7 @@ impl eframe::App for KnobifyApp {
         while let Ok(event) = self.rx.try_recv() {
             self.handle_event(event, ctx, now);
         }
-        self.drain_settings_actions(now);
+        self.drain_settings_actions(ctx, now);
 
         if self.osd.needs_reposition {
             if let Some(pos) = osd::compute_position(frame, ctx, &self.settings.osd) {
@@ -284,8 +398,13 @@ impl eframe::App for KnobifyApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let now = Instant::now();
 
-        if !self.first_frame_done {
-            self.first_frame_done = true;
+        // eframe keeps the root hidden until the first frame is painted and then
+        // calls `set_visible(true)`, which makes winit rewrite the whole
+        // `GWL_EXSTYLE` word - dropping the bits added during that same frame.
+        // So apply them on the first two passes, and make sure a second pass
+        // happens (an idle popup asks for no repaints at all).
+        if self.styled_passes < 2 {
+            self.styled_passes += 1;
             if let Some(window) = frame.winit_window() {
                 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
                 if let Ok(handle) = window.window_handle() {
@@ -297,6 +416,7 @@ impl eframe::App for KnobifyApp {
                     }
                 }
             }
+            ui.ctx().request_repaint();
         }
 
         osd::draw(ui, &self.osd, &self.settings.osd, now);
@@ -310,8 +430,6 @@ impl eframe::App for KnobifyApp {
                 },
             );
         }
-
-        let _ = &self.handle;
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {

@@ -23,7 +23,10 @@ impl AppHandle {
             log::debug!("UI receiver dropped; event discarded");
             return;
         }
-        self.ctx.request_repaint();
+        // Only the root viewport runs `App::logic`, which is what drains this
+        // channel, so wake that one explicitly instead of relying on
+        // `request_repaint`'s "current viewport" (unset off the UI thread).
+        self.ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
     pub fn send_spotify(&self, event: SpotifyEvent) {

@@ -213,6 +213,10 @@ pub fn load(path: &Path) -> Result<Settings, ConfigError> {
 }
 
 /// Atomically write settings (temp file + rename), creating parent directories.
+///
+/// Writes `settings` as given; callers pass [`Settings::sanitized`] values (the
+/// UI sanitizes on Save, [`load`] sanitizes on read), so a config file written
+/// by Knobify is always in range.
 pub fn save(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
     let text = toml::to_string_pretty(settings)?;
     let write_err = |source| ConfigError::Write {
@@ -224,7 +228,11 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
     }
     let tmp = path.with_extension("toml.tmp");
     fs::write(&tmp, text).map_err(write_err)?;
-    fs::rename(&tmp, path).map_err(write_err)?;
+    if let Err(source) = fs::rename(&tmp, path) {
+        // Never leave a stale temporary file behind for the next launch.
+        let _ = fs::remove_file(&tmp);
+        return Err(write_err(source));
+    }
     Ok(())
 }
 

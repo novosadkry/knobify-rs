@@ -51,7 +51,10 @@ pub enum TrayAction {
 #[derive(Debug, Clone)]
 pub enum AppEvent {
     Hotkey(HotkeyAction),
-    KeyCaptured { target: BindingTarget, key: KeyCode },
+    KeyCaptured {
+        target: BindingTarget,
+        key: KeyCode,
+    },
     CaptureCancelled,
     /// The global hook could not be installed in `grab` mode and fell back to
     /// passive listening; key suppression is unavailable.

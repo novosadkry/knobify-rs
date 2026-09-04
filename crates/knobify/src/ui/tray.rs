@@ -21,9 +21,11 @@ const ID_SETTINGS: &str = "settings";
 const ID_LOGIN: &str = "login";
 const ID_EXIT: &str = "exit";
 
+const TOOLTIP_SETUP: &str = "Knobify — open Settings and paste your Spotify client ID";
 const TOOLTIP_LOGGED_OUT: &str = "Knobify — not logged in";
 const TOOLTIP_LOGGED_IN: &str = "Knobify — logged in";
 
+const LABEL_SETUP: &str = "Set up Spotify…";
 const LABEL_LOG_IN: &str = "Log in to Spotify";
 const LABEL_LOGGING_IN: &str = "Logging in…";
 const LABEL_LOG_OUT: &str = "Log out";
@@ -54,7 +56,7 @@ impl TrayUi {
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon)
-            .with_tooltip(TOOLTIP_LOGGED_OUT)
+            .with_tooltip(TOOLTIP_SETUP)
             .with_menu_on_left_click(false)
             .build()
             .context("creating the tray icon")?;
@@ -88,19 +90,24 @@ impl TrayUi {
     }
 
     /// Update the login/logout label and tooltip.
-    pub fn set_auth(&self, auth: &AuthState) {
-        let (label, enabled) = match auth {
-            AuthState::LoggedOut | AuthState::Failed(_) => (LABEL_LOG_IN, true),
-            AuthState::LoggingIn { .. } => (LABEL_LOGGING_IN, false),
-            AuthState::LoggedIn { .. } => (LABEL_LOG_OUT, true),
+    ///
+    /// `configured` is false until a Spotify client ID is set: logging in
+    /// cannot work yet, so the item leads to Settings instead (see
+    /// `App::handle_event` for [`TrayAction::LoginOrLogout`]).
+    pub fn set_state(&self, auth: &AuthState, configured: bool) {
+        let (label, enabled) = match (configured, auth) {
+            (false, _) => (LABEL_SETUP, true),
+            (true, AuthState::LoggedOut | AuthState::Failed(_)) => (LABEL_LOG_IN, true),
+            (true, AuthState::LoggingIn { .. }) => (LABEL_LOGGING_IN, false),
+            (true, AuthState::LoggedIn { .. }) => (LABEL_LOG_OUT, true),
         };
         self.login_item.set_text(label);
         self.login_item.set_enabled(enabled);
 
-        let tooltip = if auth.is_logged_in() {
-            TOOLTIP_LOGGED_IN
-        } else {
-            TOOLTIP_LOGGED_OUT
+        let tooltip = match (configured, auth.is_logged_in()) {
+            (false, _) => TOOLTIP_SETUP,
+            (true, false) => TOOLTIP_LOGGED_OUT,
+            (true, true) => TOOLTIP_LOGGED_IN,
         };
         let _ = self.icon.set_tooltip(Some(tooltip));
     }

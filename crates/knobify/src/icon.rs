@@ -1,4 +1,9 @@
 //! The application icon, embedded at compile time.
+//!
+//! Decoding is memoized: `ViewportBuilder`s are rebuilt on every pass while a
+//! window is open, and re-decoding the `.ico` each time would be pure waste.
+
+use std::sync::{Arc, OnceLock};
 
 use anyhow::Context;
 
@@ -28,11 +33,20 @@ pub fn tray_icon() -> anyhow::Result<tray_icon::Icon> {
     tray_icon::Icon::from_rgba(icon.pixels, icon.width, icon.height).context("building tray icon")
 }
 
-pub fn egui_icon() -> anyhow::Result<egui::IconData> {
-    let icon = rgba()?;
-    Ok(egui::IconData {
-        rgba: icon.pixels,
-        width: icon.width,
-        height: icon.height,
+/// The window icon, decoded once per process. `None` when the embedded icon
+/// cannot be decoded (logged once).
+pub fn egui_icon() -> Option<Arc<egui::IconData>> {
+    static ICON: OnceLock<Option<Arc<egui::IconData>>> = OnceLock::new();
+    ICON.get_or_init(|| match rgba() {
+        Ok(icon) => Some(Arc::new(egui::IconData {
+            rgba: icon.pixels,
+            width: icon.width,
+            height: icon.height,
+        })),
+        Err(e) => {
+            log::warn!("cannot decode the window icon: {e:#}");
+            None
+        }
     })
+    .clone()
 }

@@ -36,8 +36,8 @@ impl Rect {
 #[cfg(windows)]
 pub fn apply_osd_exstyles(hwnd: isize) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-        SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, WS_EX_NOACTIVATE,
+        GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_NOACTIVATE,
         WS_EX_TOOLWINDOW,
     };
 
@@ -74,7 +74,7 @@ pub fn apply_osd_exstyles(hwnd: isize) {
 #[cfg(windows)]
 pub fn primary_work_area() -> Option<Rect> {
     use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
 
     let mut rect = RECT {
         left: 0,
@@ -105,8 +105,8 @@ pub fn primary_work_area() -> Option<Rect> {
 #[cfg(windows)]
 pub fn set_rounded_corners(hwnd: isize) {
     use windows_sys::Win32::Graphics::Dwm::{
-        DWM_WINDOW_CORNER_PREFERENCE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-        DwmSetWindowAttribute,
+        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DWM_WINDOW_CORNER_PREFERENCE,
     };
 
     let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
