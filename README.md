@@ -27,7 +27,8 @@ playback control for Premium users).
    can close it.
 4. In Settings → **Knob bindings**, click **Rebind** next to *Volume up*, turn
    the knob up (or press the key) and repeat for *Volume down* and, if you
-   want, *Mute*. Keys Windows does not name show up as `Key 0x82`-style names.
+   want, *Mute*. Keys Windows does not name — the knob's OEM codes and the
+   media keys — show up as `Key 0x82`-style names.
 5. Save. Turn the knob: the popup appears and Spotify's volume follows.
 
 ## Settings
@@ -49,15 +50,19 @@ Everything except *transparent* applies immediately on Save.
 
 | Popup says | Cause and fix |
 |---|---|
+| Set up Spotify | No client ID yet: open Settings from the tray and paste it (the tray item reads *Set up Spotify…* until then) |
 | Not logged in | Log in from the tray menu or Settings |
 | No active Spotify device | Start playback on any device first; Spotify only reports the active one |
-| Volume control not allowed | That device rejects remote volume changes (some speakers, group sessions) |
+| Volume control not allowed | That device rejects remote volume changes (some speakers, group sessions). Knobify stops sending until you switch device; it re-checks every few seconds |
 | Spotify Premium required | Playback control is a Premium-only API |
 | Slow down | Spotify rate limit; Knobify waits the requested time and retries |
 | Offline | No network or Spotify unreachable |
 
-Logs: run `knobify.exe` from a terminal with `RUST_LOG=debug` to see what the
-hook and the Spotify service are doing.
+Logs: `%APPDATA%\knobify\knobify.log`, rewritten on every start. It records the
+config path, whether a login token is cached, which keyboard hook mode is
+active and where the popup was placed. Set `RUST_LOG=debug` (or
+`RUST_LOG=knobify=trace`) before starting `knobify.exe` for more detail — the
+release build has no console, so the file is the only output.
 
 ## Building
 
@@ -96,6 +101,11 @@ Things that can only be checked on a real Windows machine:
 4. Rebind → press knob → the row shows the new key; Save; the new key works.
 5. Enable *Swallow bound keys* with a media key bound: Windows' own volume no longer changes.
 6. Toggle *transparent* off, restart: popup renders as an opaque dark panel.
-7. Exit from the tray menu quits the process.
+7. Exit from the tray menu quits the process (check Task Manager: no leftover
+   `knobify.exe`).
+8. The popup window is not in Alt+Tab and never takes focus, and clicks go
+   through it to whatever is underneath.
+9. With *transparent* off and Settings open, no dark rectangle is left on the
+   desktop while the popup is idle.
 
 See `docs/ARCHITECTURE.md` for the design.

@@ -23,8 +23,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Core tests (host)
         run: cargo test -p knobify-core --target x86_64-unknown-linux-gnu
+      # Clippy never links, so the Windows GNU target needs no mingw-w64 here
+      # (`.cargo/config.toml` points that target's linker at mingw for local
+      # release builds). The Windows job below does the real build.
       - name: Clippy (Windows target)
         run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+      - name: Check the listen-only feature
+        run: cargo check -p knobify --features listen-only --target x86_64-pc-windows-gnu
 
   windows-build:
     name: Build + test (Windows)

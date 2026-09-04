@@ -21,7 +21,7 @@ the core on the host with `cargo test -p knobify-core --target x86_64-unknown-li
 ```
 rdev grab thread ─┐                                 ┌─> SpotifyHandle (tokio mpsc) ─> tokio thread: actor (all HTTP, Coalescer)
 tray callbacks  ──┼─> AppHandle { mpsc<AppEvent>, egui::Context } ─> UI thread: App::logic drains, App::ui paints the OSD root
-tokio actor     ──┘      send() = tx.send + ctx.request_repaint()   └─> Settings = deferred child viewport (Arc<Mutex<SettingsState>>)
+tokio actor     ──┘      send() = tx.send + repaint_of(ROOT)        └─> Settings = deferred child viewport (Arc<Mutex<SettingsState>>)
 ```
 
 * **UI thread** (eframe/winit main loop). Owns `KnobifyApp`, the tray icon and
@@ -45,12 +45,30 @@ tokio actor     ──┘      send() = tx.send + ctx.request_repaint()   └─
   only viewport *commands* there, never `viewport_output`, so a hidden root
   can neither create nor show a child viewport, and hidden-window repaints are
   throttled to a 100 ms heartbeat.
-* After the first frame, `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` are added to
-  the root HWND (winit's `with_taskbar(false)` only removes the taskbar button,
-  not the Alt+Tab entry).
+* `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` are added to the root HWND (winit's
+  `with_taskbar(false)` only removes the taskbar button, not the Alt+Tab entry).
+  They are re-applied on the **first two** passes and after every visibility
+  toggle: winit's `WindowFlags::apply_diff` rewrites the whole `GWL_EXSTYLE`
+  word on any flag change, and eframe calls `set_visible(true)` right after the
+  first painted frame, which would otherwise drop the bits again. `App::ui`
+  requests one extra repaint so that second pass exists at all (an idle popup
+  asks for no repaints).
 * **Settings is a deferred child viewport** (`ctx.show_viewport_deferred`)
   shown every root pass while open. Its callback edits `Arc<Mutex<SettingsState>>`
-  and pushes `SettingsAction`s that `App::logic` drains.
+  and pushes `SettingsAction`s that `App::logic` drains. A repaint of a deferred
+  viewport runs **only its callback**, not `App::logic`, so the callback ends
+  with `request_repaint_of(ViewportId::ROOT)` whenever it queued an action -
+  without it every button in the window would look dead until something else
+  woke the root. The same applies in reverse: the root repaints the settings
+  viewport (`request_repaint_of(settings::viewport_id())`) after it changes
+  `SettingsState`. `AppHandle::send` also targets `ViewportId::ROOT` explicitly.
+* Closing the window (X or **Close**) queues `SettingsAction::Close`; the root
+  drops `settings_ui`, stops showing the viewport, and egui destroys the window.
+  Reopening from the tray builds a fresh `SettingsState`.
+* In the **opaque fallback** the root has to stay mapped while Settings is open
+  (a hidden root cannot host a child viewport), but an empty opaque pass is a
+  dark rectangle, so `OsdState` parks the window off-screen until the popup has
+  something to paint.
 * Renderer is **glow**. egui-wgpu selects `CompositeAlphaMode` from the
   adapter, and DX12 generally offers only `Opaque`, so wgpu cannot produce a
   transparent window on Windows. glow/WGL alpha is driver-dependent, therefore
@@ -76,6 +94,19 @@ tokio actor     ──┘      send() = tx.send + ctx.request_repaint()   └─
   120 ms of quiet, re-arms if the target moved during a request, and backs off
   on 429. Reconcile with `current_playback` on login, 1.5 s after a burst, and
   when a burst starts after more than 30 s idle.
+* `Playback` snapshots move `VolumeModel` **only** when the last knob tick is
+  more than 1.5 s old (`BURST_GRACE` in `app.rs`), so a reconcile never yanks
+  the bar while the user is still turning. `VolumeApplied` clears the pending
+  marker (the dot on the popup) once the applied value equals the local one.
+* `PlaybackSnapshot::supports_volume == false` disables the volume path: the
+  next tick shows "Volume control not allowed" instead of a bar that cannot
+  move, and re-reads the playback state at most every 5 s so switching to a
+  device that does allow it recovers by itself.
+* The actor refreshes `current_playback` itself after a restore or a login; the
+  UI must not send its own `Refresh` on `Auth(LoggedIn)`.
+* A panic in the actor thread is reported as
+  `Error(Other("Spotify service crashed, restart Knobify"))` by a `Drop` guard
+  on that thread, instead of leaving volume control silently dead.
 
 ## Configuration
 
@@ -91,7 +122,7 @@ step = 5                    # 1..=25
 [bindings]
 volume_up = "0x82"          # "Name" of an rdev::Key variant, or hex virtual-key code
 volume_down = "0x81"
-# mute = "VolumeMute"
+# mute = "0xAD"             # rdev 0.5.3 has no media-key variants (see below)
 suppress = false            # swallow bound keys so Windows never sees them
 
 [osd]
@@ -101,6 +132,47 @@ position = "BottomCenter"   # TopLeft TopCenter TopRight BottomLeft BottomCenter
 margin = 48.0
 transparent = true
 ```
+
+## Logging
+
+`env_logger` writes to `<config dir>/knobify/knobify.log`, truncated on every
+start (`info` by default, `RUST_LOG` still honoured); debug builds also echo to
+stderr. The release binary is linked with `windows_subsystem = "windows"`, so it
+has no console and stderr goes nowhere even when started from a terminal - hence
+the file. One info line each per start records the config path, the log path,
+whether the token cache exists, the loaded settings summary, the hook mode
+(grab/listen) and the first popup placement (work area, source, DPI, result);
+later placements are debug.
+
+## Verified crate behaviour
+
+Things that are easy to get wrong and were read out of the vendored sources
+(docs.rs is unreachable from the sandbox; sources are under
+`~/.cargo/registry/src/*/`):
+
+* **rspotify-model 0.16.1 `Device` has no `supports_volume` field** (only `id`,
+  `is_active`, `is_private_session`, `is_restricted`, `name`, `type`,
+  `volume_percent`), so `PlaybackSnapshot::supports_volume` is derived as
+  `volume_percent.is_some() && !is_restricted`.
+* **`read_token_cache` errors when the cache file is missing** - `Token::from_cache`
+  starts with `File::open(..)?` - which is the normal first-run state, so
+  `restore_session` maps any error to "not logged in" and logs at debug. It
+  returns `Ok(None)` for a token whose scopes are a subset mismatch.
+* **`rdev::grab` requires `Fn`** (`listen` takes `FnMut`), so the hook callback
+  cannot own mutable state; the swallowed-release tracking lives in a `Cell`.
+* **rdev 0.5.3 knows no media keys**: `Key` has no `VolumeUp`/`VolumeDown`/
+  `VolumeMute` variants, so those arrive as `Key::Unknown(0xAF/0xAE/0xAD)` and
+  are stored as raw codes. Every named variant's `Debug` output is ASCII
+  alphanumeric (`AltGr`, `IntlBackslash`, `KpReturn`, `Function`, ...), which is
+  exactly what `KeyCode::from_str` accepts; `Unknown(code)` is converted
+  separately, so no name that reaches the config can fail to parse back.
+* **winit 0.30 rewrites both style words** (`SetWindowLongW(GWL_STYLE/GWL_EXSTYLE)`)
+  in `WindowFlags::apply_diff` whenever any window flag changes, and it never
+  sets `WS_EX_TOOLWINDOW`/`WS_EX_NOACTIVATE` itself - see the windowing notes
+  above for how Knobify keeps them.
+* **eframe 0.36 runs a deferred viewport's callback alone**, without
+  `App::logic`, and starts the root window hidden until the first frame is
+  painted (`Integration::post_rendering` -> `set_visible(true)`).
 
 ## Coding rules
 
