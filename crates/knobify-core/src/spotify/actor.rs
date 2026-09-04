@@ -20,20 +20,21 @@ use super::{
 
 /// The same error is never shown to the user more than once per this window.
 const ERROR_THROTTLE: Duration = Duration::from_secs(2);
-/// After a burst, re-read the real device volume this long after the last PUT.
-const RECONCILE_AFTER: Duration = Duration::from_millis(1500);
-/// A burst that starts after this much silence gets a background reconcile.
-const IDLE_RECONCILE: Duration = Duration::from_secs(30);
 /// After this many consecutive failed PUTs, drop the pending value.
 const MAX_CONSECUTIVE_FAILURES: u32 = 2;
 
-/// Messages that background tasks (login, background refresh) send back to the
-/// actor so that all mutable state stays on the actor's own task.
+/// Messages that background tasks (the login) send back to the actor so that
+/// all mutable state stays on the actor's own task.
 enum Internal {
     LoginDone(Result<(), UserFacing>),
-    /// A volume read from the device by a background refresh.
-    Observed(u8),
 }
+
+// This actor deliberately never re-reads the device after sending a volume.
+// `GET /me/player` reports a change the API has already accepted only 0.4 s to
+// 2.4 s later (measured), so any such read is likely to answer with the volume
+// from *before* the change and would undo the turn that caused it. The volume
+// is instead read on demand, before a knob tick works from it, by
+// `ReadVolume` - see `crate::readback`.
 
 /// Runs until `Shutdown` is received or the command channel closes.
 pub async fn run(cfg: SpotifyConfig, mut rx: mpsc::UnboundedReceiver<SpotifyCmd>, sink: EventSink) {
@@ -76,10 +77,6 @@ struct ActorState {
     login_cancel: Option<CancellationToken>,
     /// Set while a cancelled login task is still winding down.
     login_cancelled: bool,
-    /// Single timer for the post-burst reconcile, reset on every send.
-    reconcile_at: Option<Instant>,
-    /// Last time we knew the device volume for sure (PUT accepted or read).
-    last_synced: Option<Instant>,
     consecutive_failures: u32,
     /// A 401 buys one token refresh + retry per burst.
     auth_retry_used: bool,
@@ -101,8 +98,6 @@ impl ActorState {
             logged_in: false,
             login_cancel: None,
             login_cancelled: false,
-            reconcile_at: None,
-            last_synced: None,
             consecutive_failures: 0,
             auth_retry_used: false,
             last_error: None,
@@ -166,15 +161,12 @@ impl ActorState {
     }
 
     fn next_wakeup(&self) -> Option<Instant> {
-        match (self.coalescer.next_deadline(), self.reconcile_at) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        self.coalescer.next_deadline()
     }
 
     async fn handle_cmd(&mut self, cmd: SpotifyCmd, itx: &mpsc::UnboundedSender<Internal>) {
         match cmd {
-            SpotifyCmd::SetVolume(volume) => self.on_local_volume(volume.min(100), itx),
+            SpotifyCmd::SetVolume(volume) => self.on_local_volume(volume.min(100)),
             SpotifyCmd::Refresh => self.refresh(true).await,
             SpotifyCmd::ReadVolume => {
                 // The knob has been touched even though no volume has been
@@ -192,7 +184,6 @@ impl ActorState {
                 self.cancel_login();
                 auth::logout(&self.client, &self.cfg).await;
                 self.coalescer = Coalescer::default();
-                self.reconcile_at = None;
                 self.set_logged_out();
             }
             SpotifyCmd::SetClientId(id) => {
@@ -231,7 +222,6 @@ impl ActorState {
         self.cancel_login();
         self.client = auth::build_client(&self.cfg);
         self.coalescer = Coalescer::default();
-        self.reconcile_at = None;
         self.consecutive_failures = 0;
         self.last_error = None;
         if restore {
@@ -241,8 +231,7 @@ impl ActorState {
         }
     }
 
-    fn on_local_volume(&mut self, volume: u8, itx: &mpsc::UnboundedSender<Internal>) {
-        let now = Instant::now();
+    fn on_local_volume(&mut self, volume: u8) {
         if !self.configured() {
             self.emit_error(UserFacing::LoginFailed(
                 "Set your Spotify client ID in Settings".to_owned(),
@@ -250,19 +239,7 @@ impl ActorState {
             return;
         }
         self.user_interacted = true;
-        // A burst that starts after a long silence may be working from a stale
-        // baseline: reconcile in the background without holding up the tick.
-        if self.coalescer.is_idle() && self.stale(now) {
-            self.spawn_background_refresh(itx);
-        }
-        self.coalescer.on_local(volume, now);
-    }
-
-    fn stale(&self, now: Instant) -> bool {
-        self.logged_in
-            && self
-                .last_synced
-                .is_none_or(|at| now.duration_since(at) > IDLE_RECONCILE)
+        self.coalescer.on_local(volume, Instant::now());
     }
 
     /// Cancels a login in progress. Returns true when there was one.
@@ -346,17 +323,12 @@ impl ActorState {
                     }
                 }
             }
-            Internal::Observed(volume) => self.coalescer.on_remote_observed(volume),
         }
     }
 
     async fn on_timer(&mut self) {
         if let Some(volume) = self.coalescer.take_send(Instant::now()) {
             self.send_volume(volume).await;
-        }
-        if self.reconcile_at.is_some_and(|at| Instant::now() >= at) {
-            self.reconcile_at = None;
-            self.refresh(false).await;
         }
     }
 
@@ -402,9 +374,6 @@ impl ActorState {
         self.coalescer.on_sent_ok(volume, now);
         self.consecutive_failures = 0;
         self.auth_retry_used = false;
-        self.last_synced = Some(now);
-        // One timer, pushed back by every send, so it fires after the burst.
-        self.reconcile_at = Some(now + RECONCILE_AFTER);
         self.emit(SpotifyEvent::VolumeApplied(volume));
     }
 
@@ -453,7 +422,6 @@ impl ActorState {
                 if let Some(volume) = snapshot.volume {
                     self.coalescer.on_remote_observed(volume);
                 }
-                self.last_synced = Some(Instant::now());
                 self.consecutive_failures = 0;
                 self.auth_retry_used = false;
                 self.emit(SpotifyEvent::Playback(snapshot));
@@ -476,33 +444,6 @@ impl ActorState {
                 }
             }
         }
-    }
-
-    /// Read the playback state without blocking the actor loop. The result is
-    /// reported straight to the UI; only the coalescer baseline comes back
-    /// through the internal channel.
-    fn spawn_background_refresh(&mut self, itx: &mpsc::UnboundedSender<Internal>) {
-        // Count it as synced right away so a long burst spawns exactly one.
-        self.last_synced = Some(Instant::now());
-        let client = self.client.clone();
-        let sink = Arc::clone(&self.sink);
-        let itx = itx.clone();
-        tokio::spawn(async move {
-            match client
-                .current_playback(None, Some([&AdditionalType::Track]))
-                .await
-            {
-                Ok(Some(context)) => {
-                    let snapshot = snapshot_of(&context);
-                    if let Some(volume) = snapshot.volume {
-                        let _ = itx.send(Internal::Observed(volume));
-                    }
-                    sink(SpotifyEvent::Playback(snapshot));
-                }
-                Ok(None) => log::debug!("background reconcile: no active playback"),
-                Err(e) => log::debug!("background reconcile failed: {}", classify(e).await),
-            }
-        });
     }
 }
 
@@ -738,8 +679,7 @@ mod tests {
         state.client = mock_client(&api.base_url, &cache_path);
         state.logged_in = true;
         state.user_interacted = true;
-        // A fresh baseline, as if a reconcile had just run.
-        state.last_synced = Some(Instant::now());
+        // A baseline, as if the volume had just been read back.
         state.coalescer.on_remote_observed(37);
         if let Ok(mut events) = events.lock() {
             events.clear();
@@ -748,14 +688,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_burst_of_ticks_becomes_one_put_and_arms_the_reconcile() {
+    async fn a_burst_of_ticks_becomes_one_put_and_nothing_is_read_back_after_it() {
         let api = MockApi::start("200 OK", PLAYBACK_AT_37).await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut state, events) = logged_in_state(&api, &dir);
-        let (itx, _irx) = mpsc::unbounded_channel();
 
         for volume in 38..=48 {
-            state.on_local_volume(volume, &itx);
+            state.on_local_volume(volume);
         }
         assert!(
             api.requests().is_empty(),
@@ -776,21 +715,12 @@ mod tests {
             events.lock().map(|e| e.clone()).unwrap_or_default(),
             vec![SpotifyEvent::VolumeApplied(48)]
         );
-        assert!(state.reconcile_at.is_some(), "the reconcile must be armed");
-        assert_eq!(state.next_wakeup(), state.reconcile_at);
-
-        // Fire the reconcile: one GET, one playback snapshot, timer cleared.
-        state.reconcile_at = Some(Instant::now());
+        // Nothing is scheduled after the send. Re-reading the device now
+        // would answer with the volume from before the PUT (Spotify needs
+        // seconds to catch up) and hand the UI a value that undoes the turn.
+        assert_eq!(state.next_wakeup(), None, "no reconcile may be armed");
         state.on_timer().await;
-        let requests = api.requests();
-        assert_eq!(requests.len(), 2, "{requests:?}");
-        assert!(requests[1].starts_with("GET /v1/me/player"), "{requests:?}");
-        assert_eq!(state.reconcile_at, None);
-        let seen = events.lock().map(|e| e.clone()).unwrap_or_default();
-        assert!(
-            matches!(seen.last(), Some(SpotifyEvent::Playback(snapshot)) if snapshot.volume == Some(37)),
-            "{seen:?}"
-        );
+        assert_eq!(api.requests().len(), 1, "the timer must read nothing");
         assert_eq!(state.next_wakeup(), None, "nothing left to do");
     }
 
@@ -800,9 +730,8 @@ mod tests {
         let api = MockApi::start("403 Forbidden", body).await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut state, events) = logged_in_state(&api, &dir);
-        let (itx, _irx) = mpsc::unbounded_channel();
 
-        state.on_local_volume(50, &itx);
+        state.on_local_volume(50);
         wait_until(state.next_wakeup()).await;
         state.on_timer().await;
         assert_eq!(api.requests().len(), 1);
@@ -835,9 +764,8 @@ mod tests {
             MockApi::start_with_headers("429 Too Many Requests", &["Retry-After: 1"], "{}").await;
         let dir = tempfile::tempdir().expect("tempdir");
         let (mut state, events) = logged_in_state(&api, &dir);
-        let (itx, _irx) = mpsc::unbounded_channel();
 
-        state.on_local_volume(60, &itx);
+        state.on_local_volume(60);
         wait_until(state.next_wakeup()).await;
         let before = Instant::now();
         state.on_timer().await;

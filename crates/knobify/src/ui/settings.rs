@@ -7,7 +7,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use knobify_core::config::{MAX_OSD_DURATION_MS, MAX_STEP, MIN_OSD_DURATION_MS, MIN_STEP};
+use knobify_core::config::{
+    MAX_OSD_DURATION_MS, MAX_STEP, MAX_SYNC_DELAY_MS, MIN_OSD_DURATION_MS, MIN_STEP,
+    MIN_SYNC_DELAY_MS,
+};
 use knobify_core::spotify::AuthState;
 use knobify_core::{BindingTarget, KeyCode, OsdPosition, Settings};
 
@@ -308,6 +311,22 @@ fn show_behaviour_section(ui: &mut egui::Ui, state: &mut SettingsState) {
         if response.changed() {
             state.status_line = None;
         }
+
+        let response = ui
+            .add(
+                egui::Slider::new(
+                    &mut state.draft.sync_delay_ms,
+                    MIN_SYNC_DELAY_MS..=MAX_SYNC_DELAY_MS,
+                )
+                .text("Spotify sync delay, ms"),
+            )
+            .on_hover_text(
+                "Spotify reports a volume change one to three seconds after accepting it.                  Inside this window Knobify trusts its own value and ignores Spotify's;                  after it, Spotify is read again before the knob works from it.",
+            );
+        if response.changed() {
+            state.status_line = None;
+        }
+        ui.small("Raise this if a turn of the knob gets pulled back to an older value.");
 
         let suppress_disabled = state.suppress_unavailable;
         ui.add_enabled_ui(!suppress_disabled, |ui| {

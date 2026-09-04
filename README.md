@@ -45,6 +45,7 @@ Stored in `%APPDATA%\knobify\config.toml`; the login token in
 | Client ID / Redirect port | Your Spotify app credentials and loopback port |
 | Step per tick | Volume change per knob tick (1–25 %) |
 | Swallow bound keys | Bound keys are consumed and never reach other apps (useful when a media key is bound) |
+| Spotify sync delay | How long Spotify takes to report a volume you just set (default 3000 ms). Inside this window Knobify trusts its own value; after it, it re-reads Spotify before the next turn. Raise it if a turn of the knob gets pulled back to an older value |
 | Popup: enabled, duration, position, margin | How and where the volume popup appears |
 | Popup: transparent | Per-pixel transparent popup window. Turn **off** (and restart) if your GPU driver renders it as a black rectangle |
 
@@ -108,14 +109,16 @@ Things that can only be checked on a real Windows machine:
 3. Turn the knob: popup appears at the configured position, Spotify volume changes, popup hides after the configured duration.
 4. Change the volume in the Spotify app, then turn the knob: it continues from
    the value Spotify shows, not from the last value Knobify sent.
-5. Rebind → press knob → the row shows the new key; Save; the new key works.
-6. Enable *Swallow bound keys* with a media key bound: Windows' own volume no longer changes.
-7. Toggle *transparent* off, restart: popup renders as an opaque dark panel.
-8. Exit from the tray menu quits the process (check Task Manager: no leftover
+5. Turn the knob a long way in one go, pause a second, keep turning: the value
+   never gets pulled back to an earlier one.
+6. Rebind → press knob → the row shows the new key; Save; the new key works.
+7. Enable *Swallow bound keys* with a media key bound: Windows' own volume no longer changes.
+8. Toggle *transparent* off, restart: popup renders as an opaque dark panel.
+9. Exit from the tray menu quits the process (check Task Manager: no leftover
    `knobify.exe`).
-9. The popup window is not in Alt+Tab and never takes focus, and clicks go
-   through it to whatever is underneath.
-10. With *transparent* off and Settings open, no dark rectangle is left on the
+10. The popup window is not in Alt+Tab and never takes focus, and clicks go
+    through it to whatever is underneath.
+11. With *transparent* off and Settings open, no dark rectangle is left on the
     desktop while the popup is idle.
 
 See `docs/ARCHITECTURE.md` for the design.

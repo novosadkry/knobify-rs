@@ -48,8 +48,8 @@ tokio actor     ──┘      send() = tx.send + repaint_of(ROOT)        └─
   that silently does nothing leaves the user unable to fix a wrong binding, so
   it must not share a failure mode with the thing it exists to configure.
 * **Spotify thread** runs a current-thread tokio runtime hosting the actor,
-  which owns the `AuthCodePkceSpotify` client, coalesces volume changes and
-  reconciles with `current_playback`.
+  which owns the `AuthCodePkceSpotify` client and coalesces volume changes. It
+  never re-reads the device after sending one; see the read-back below.
 
 ## Windowing model (eframe 0.36)
 
@@ -118,26 +118,38 @@ tokio actor     ──┘      send() = tx.send + repaint_of(ROOT)        └─
 * Volume path: the UI updates `VolumeModel` instantly and shows the OSD; every
   change sends `SpotifyCmd::SetVolume`. The actor's `Coalescer` PUTs once after
   120 ms of quiet, re-arms if the target moved during a request, and backs off
-  on 429. Reconcile with `current_playback` on login, 1.5 s after a burst, and
-  when a burst starts after more than 30 s idle.
+  on 429. It reads `current_playback` on login, on `Refresh`, and on
+  `ReadVolume` - never on a timer after a send.
+* **Why nothing is read back *after* a change.** Measured against the real
+  service, `GET /me/player` reported a volume that `PUT /me/player/volume` had
+  already accepted (204) only 0.4 s to 2.4 s later. A reconcile a fixed delay
+  after a send therefore answers with the volume from *before* it, and adopting
+  that undoes the turn that caused it - which is exactly what a post-burst
+  reconcile at 1.5 s did. There is no safe fixed delay, so the device is read
+  before a tick works from it instead of after one changes it.
 * Read-back (`readback.rs`): a knob tick is relative, so it is only as right as
   the value it is added to, and a volume changed in the Spotify app or on
   another device would make it jump. `Readback` therefore holds the send of the
-  first tick of a turn while `SpotifyCmd::ReadVolume` reads the device
-  (`DEFAULT_STALE_AFTER` 1 s decides whether the baseline is worth trusting;
-  confirmed sends and adopted snapshots keep it fresh, so the rest of the turn
-  goes out immediately). Ticks that arrive during the wait join the replay and
+  first tick of a turn while `SpotifyCmd::ReadVolume` reads the device. Ticks
+  that arrive during the wait join the replay and
   are re-applied on top of the answer, so one read and one PUT carry the whole
   turn. Because nothing has been sent yet, the reading cannot be an echo of
   this app's own change, which is what makes replaying it safe. The popup is
   never held back - it shows the tick at once and corrects itself if the
   reading disagrees - and `DEFAULT_TIMEOUT` (600 ms) or any Spotify error sends
   the turn anyway rather than swallowing it.
+* **The sync delay** (`sync_delay_ms`, default 3000, a slider in Settings) is
+  the one number both halves of that use, and it means "how long Spotify may
+  take to report a volume we set". Inside it the local value is the authority,
+  so no read-back is needed and no snapshot is believed; outside it Spotify is
+  the authority, so a baseline that old is re-read before a tick works from it.
+  Merging the two is deliberate: a window in which we would neither trust our
+  own value nor Spotify's has no correct answer in it.
 * `Playback` snapshots move `VolumeModel` **only** when a read-back is waiting
-  for one, or when the last knob tick is more than 1.5 s old (`BURST_GRACE` in
-  `app.rs`), so a reconcile never yanks the bar while the user is still
-  turning. `VolumeApplied` clears the pending
-  marker (the dot on the popup) once the applied value equals the local one.
+  for one, or when `Readback::may_adopt` allows it - no send of ours and no
+  knob tick within the sync delay. `VolumeApplied` clears the pending marker
+  (the dot on the popup) once the applied value equals the local one, and must
+  not touch the burst guard: the knob may well still be turning.
 * `PlaybackSnapshot::supports_volume == false` disables the volume path: the
   next tick shows "Volume control not allowed" instead of a bar that cannot
   move, and re-reads the playback state at most every 5 s so switching to a

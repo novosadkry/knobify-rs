@@ -21,11 +21,6 @@ use crate::ui::osd::{self, MsgKind, OsdContent, OsdState};
 use crate::ui::settings::{self, SettingsAction, SettingsState};
 use crate::ui::tray::TrayUi;
 
-/// A knob tick less than this ago means the user is still turning the knob, so
-/// a playback snapshot must not move the bar under their fingers. The actor
-/// reconciles 1.5 s after the last accepted PUT, i.e. just outside this window.
-const BURST_GRACE: Duration = Duration::from_millis(1500);
-
 /// How often a tick on a device that refuses volume control may re-read the
 /// playback state to find out whether that is still true.
 const DEVICE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
@@ -45,8 +40,6 @@ pub struct KnobifyApp {
     osd: OsdState,
     settings_ui: Option<Arc<Mutex<SettingsState>>>,
     suppress_unavailable: bool,
-    /// When the last knob tick happened (see [`BURST_GRACE`]).
-    last_tick: Option<Instant>,
     /// False once a playback snapshot reported a device that refuses remote
     /// volume changes; the next tick then explains that instead of moving a bar
     /// that cannot move.
@@ -81,6 +74,9 @@ impl KnobifyApp {
             Arc::new(move |event| handle.send_spotify(event)),
         );
 
+        let mut readback = Readback::default();
+        readback.set_stale_after(settings.sync_delay());
+
         Ok(Self {
             settings,
             cfg_path,
@@ -89,12 +85,11 @@ impl KnobifyApp {
             hotkeys,
             tray,
             volume: VolumeModel::default(),
-            readback: Readback::default(),
+            readback,
             auth: AuthState::LoggedOut,
             osd: OsdState::default(),
             settings_ui: None,
             suppress_unavailable: false,
-            last_tick: None,
             device_allows_volume: true,
             last_device_probe: None,
             styled_passes: 0,
@@ -205,7 +200,6 @@ impl KnobifyApp {
     /// broken; it corrects itself if the reading disagrees.
     fn on_tick(&mut self, action: HotkeyAction, now: Instant) {
         self.step(action);
-        self.last_tick = Some(now);
         // Logged here rather than in the hook, where writing to a file risks
         // the callback being timed out and the hook destroyed.
         log::debug!("{action:?} -> {}%", self.volume.local);
@@ -334,27 +328,31 @@ impl KnobifyApp {
                 }
                 self.device_allows_volume = snapshot.supports_volume;
 
-                let mid_burst = self
-                    .last_tick
-                    .is_some_and(|at| now.saturating_duration_since(at) < BURST_GRACE);
                 match snapshot.volume {
-                    // The reading a held tick asked for. It predates every
-                    // volume this app has sent, so it is the truth even now,
-                    // mid-burst.
+                    // The reading a held tick asked for. It was requested only
+                    // once nothing of ours could still be settling, so it is
+                    // the truth even though the knob has just moved.
                     Some(volume) if self.readback.is_pending() => {
                         self.readback.on_synced(now);
                         self.apply_readback(volume, now);
                     }
-                    // Otherwise adopt the device's volume, but never while the
-                    // knob is being turned: the popup would jump back and
-                    // forth. The visible popup keeps the value it was shown
-                    // with; only the model moves.
-                    Some(volume) if !mid_burst => {
+                    // Otherwise Spotify only gets to move the model when it
+                    // could not be echoing a change of ours back at us, and
+                    // not while the knob is turning.
+                    Some(volume) if self.readback.may_adopt(now) => {
+                        if volume != self.volume.local {
+                            log::debug!(
+                                "adopting the device volume {volume}% over the local {}%",
+                                self.volume.local
+                            );
+                        }
                         self.volume.sync_remote(volume);
                         self.readback.on_synced(now);
                     }
                     Some(volume) => {
-                        log::debug!("keeping the local volume; device reports {volume} mid-burst");
+                        log::debug!(
+                            "ignoring the device volume {volume}%: a change of ours may still                              be settling, or the knob is moving"
+                        );
                     }
                     // The device has no volume to report, so a held tick has
                     // nothing to wait for.
@@ -365,13 +363,11 @@ impl KnobifyApp {
                 // Spotify accepted this value, so the device is at it: the
                 // baseline is fresh and the rest of the turn needs no reading.
                 self.readback.on_synced(now);
-                if self.volume.local == volume {
-                    // Everything the user asked for has landed: drop the
-                    // "pending" dot (and let a snapshot sync the model again).
-                    self.last_tick = None;
-                    if self.osd.is_visible(now) {
-                        self.show_volume(now, false);
-                    }
+                // Everything the user asked for has landed: drop the
+                // "pending" dot. This must not touch the burst guard - the
+                // knob may well still be turning.
+                if self.volume.local == volume && self.osd.is_visible(now) {
+                    self.show_volume(now, false);
                 }
             }
             SpotifyEvent::Error(error) => {
@@ -461,6 +457,9 @@ impl KnobifyApp {
         if new_settings.redirect_port != self.settings.redirect_port {
             self.spotify
                 .send(SpotifyCmd::SetRedirectPort(new_settings.redirect_port));
+        }
+        if new_settings.sync_delay_ms != self.settings.sync_delay_ms {
+            self.readback.set_stale_after(new_settings.sync_delay());
         }
         if new_settings.bindings != self.settings.bindings {
             self.hotkeys.set_bindings(new_settings.bindings.clone());

@@ -20,6 +20,13 @@ pub const MIN_STEP: u8 = 1;
 pub const MAX_STEP: u8 = 25;
 pub const MIN_OSD_DURATION_MS: u64 = 300;
 pub const MAX_OSD_DURATION_MS: u64 = 10_000;
+pub const MIN_SYNC_DELAY_MS: u64 = 250;
+pub const MAX_SYNC_DELAY_MS: u64 = 15_000;
+/// Measured against the real API: `GET /me/player` reported a volume this app
+/// had just set only 0.4 s to 2.4 s after Spotify accepted the change, so
+/// anything it says inside that window may still be the previous volume.
+/// The default keeps headroom over the worst case that was observed.
+pub const DEFAULT_SYNC_DELAY_MS: u64 = 3000;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -31,6 +38,13 @@ pub struct Settings {
     pub redirect_port: u16,
     /// Volume change per knob tick, in percent.
     pub step: u8,
+    /// How long Spotify may take to report a volume change this app made.
+    ///
+    /// Nothing Spotify says about the volume is believed inside this window
+    /// after a change of our own, because it is likely to be the *previous*
+    /// volume; and a baseline this old is re-read before the knob works from
+    /// it. Raise it if a turn of the knob gets pulled back to an older value.
+    pub sync_delay_ms: u64,
     pub bindings: Bindings,
     pub osd: OsdSettings,
 }
@@ -42,6 +56,7 @@ impl Default for Settings {
             client_id: String::new(),
             redirect_port: 8888,
             step: 5,
+            sync_delay_ms: DEFAULT_SYNC_DELAY_MS,
             bindings: Bindings::default(),
             osd: OsdSettings::default(),
         }
@@ -49,6 +64,11 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// [`Self::sync_delay_ms`] as a `Duration`.
+    pub fn sync_delay(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.sync_delay_ms)
+    }
+
     pub fn redirect_uri(&self) -> String {
         format!("http://127.0.0.1:{}/callback", self.redirect_port)
     }
@@ -58,6 +78,9 @@ impl Settings {
         self.version = CONFIG_VERSION;
         self.client_id = self.client_id.trim().to_owned();
         self.step = self.step.clamp(MIN_STEP, MAX_STEP);
+        self.sync_delay_ms = self
+            .sync_delay_ms
+            .clamp(MIN_SYNC_DELAY_MS, MAX_SYNC_DELAY_MS);
         if self.redirect_port == 0 {
             self.redirect_port = Settings::default().redirect_port;
         }
@@ -242,6 +265,7 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn default_serializes_and_parses_back_equal() {
@@ -259,6 +283,36 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn an_older_file_without_a_sync_delay_gets_the_default() {
+        let parsed: Settings = toml::from_str(
+            "step = 5
+",
+        )
+        .unwrap();
+        assert_eq!(parsed.sync_delay_ms, DEFAULT_SYNC_DELAY_MS);
+        assert_eq!(parsed.sync_delay(), Duration::from_millis(3000));
+    }
+
+    #[test]
+    fn sanitized_clamps_the_sync_delay() {
+        // Zero would believe every reading, including the ones that still
+        // report the volume from before our own change.
+        let low = Settings {
+            sync_delay_ms: 0,
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!(low.sync_delay_ms, MIN_SYNC_DELAY_MS);
+
+        let high = Settings {
+            sync_delay_ms: u64::MAX,
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!(high.sync_delay_ms, MAX_SYNC_DELAY_MS);
     }
 
     #[test]
