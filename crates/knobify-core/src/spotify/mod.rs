@@ -58,8 +58,12 @@ pub enum SpotifyEvent {
 pub enum AuthState {
     LoggedOut,
     /// Browser opened; the URL is also shown in Settings for copy/paste.
-    LoggingIn { authorize_url: String },
-    LoggedIn { display_name: Option<String> },
+    LoggingIn {
+        authorize_url: String,
+    },
+    LoggedIn {
+        display_name: Option<String>,
+    },
     Failed(String),
 }
 
@@ -104,7 +108,8 @@ pub const DEFAULT_BACKOFF: Duration = Duration::from_secs(2);
 /// runtime. Returns immediately.
 pub fn spawn_spotify(cfg: SpotifyConfig, sink: EventSink) -> SpotifyHandle {
     let (tx, rx) = mpsc::unbounded_channel();
-    std::thread::Builder::new()
+    let thread_sink = Arc::clone(&sink);
+    let spawned = std::thread::Builder::new()
         .name("knobify-spotify".into())
         .spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -114,14 +119,21 @@ pub fn spawn_spotify(cfg: SpotifyConfig, sink: EventSink) -> SpotifyHandle {
                 Ok(rt) => rt,
                 Err(e) => {
                     log::error!("cannot start tokio runtime: {e}");
-                    sink(SpotifyEvent::Error(UserFacing::Other(format!(
+                    thread_sink(SpotifyEvent::Error(UserFacing::Other(format!(
                         "cannot start Spotify service: {e}"
                     ))));
                     return;
                 }
             };
-            rt.block_on(actor::run(cfg, rx, sink));
-        })
-        .expect("spawning the Spotify thread cannot fail on Windows");
+            rt.block_on(actor::run(cfg, rx, thread_sink));
+        });
+    if let Err(e) = spawned {
+        // The receiver went with the closure, so every command from the
+        // returned handle will simply be logged and dropped.
+        log::error!("cannot start the Spotify thread: {e}");
+        sink(SpotifyEvent::Error(UserFacing::Other(format!(
+            "cannot start Spotify service: {e}"
+        ))));
+    }
     SpotifyHandle(tx)
 }
