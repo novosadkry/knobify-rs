@@ -1,0 +1,41 @@
+[package]
+name = "knobify"
+description = "Control Spotify volume with a keyboard knob: global hotkeys, on-screen volume popup, tray icon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "knobify"
+path = "src/main.rs"
+
+[features]
+default = []
+# Use rdev::listen instead of rdev::grab (key suppression unavailable).
+listen-only = []
+
+[dependencies]
+knobify-core = { path = "../knobify-core" }
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.36.1"
+winit = "0.30"
+raw-window-handle = "0.6"
+tray-icon = "0.24.2"
+rdev = { version = "0.5.3", features = ["unstable_grab"] }
+image = { version = "0.25", default-features = false, features = ["ico", "png", "bmp"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+] }
+
+[build-dependencies]
+winresource = "0.1"

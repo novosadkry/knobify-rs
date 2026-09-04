@@ -1,0 +1,10 @@
+# Knobify is a Windows-only application. The GUI crates (tray-icon, rdev) cannot
+# build for a Linux host without GTK/X11 dev libraries, so the default target is
+# the Windows GNU toolchain (cross-compiled with mingw-w64 when developing on
+# Linux). The pure `knobify-core` crate is tested on the host with:
+#   cargo test -p knobify-core --target x86_64-unknown-linux-gnu
+[build]
+target = "x86_64-pc-windows-gnu"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

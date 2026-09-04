@@ -1,15 +1,23 @@
-[package]
-name = "knobify"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["crates/knobify-core", "crates/knobify"]
 
-[dependencies]
-anyhow = "1.0.97"
-dotenv = "0.15.0"
-futures = "0.3.31"
-rdev = "0.5.3"
-rspotify = "0.14.0"
-tokio = { version = "1.43.0", features = ["full"] }
-tray-icon = "0.20.0"
-webbrowser = "1.0.3"
-winit = "0.30.9"
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.95"
+repository = "https://github.com/novosadkry/knobify-rs"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+thiserror = "2"
+anyhow = "1"
+log = "0.4"
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "io-util"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
