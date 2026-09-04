@@ -72,3 +72,59 @@ pub fn match_key(bindings: &Bindings, key: &KeyCode) -> Option<HotkeyAction> {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bindings() -> Bindings {
+        Bindings {
+            volume_up: KeyCode::Raw(0x82),
+            volume_down: KeyCode::Raw(0x81),
+            mute: Some(KeyCode::named("VolumeMute")),
+            suppress: false,
+        }
+    }
+
+    #[test]
+    fn matches_volume_up() {
+        let bindings = bindings();
+        assert_eq!(
+            match_key(&bindings, &KeyCode::Raw(0x82)),
+            Some(HotkeyAction::VolumeUp)
+        );
+    }
+
+    #[test]
+    fn matches_volume_down() {
+        let bindings = bindings();
+        assert_eq!(
+            match_key(&bindings, &KeyCode::Raw(0x81)),
+            Some(HotkeyAction::VolumeDown)
+        );
+    }
+
+    #[test]
+    fn matches_mute() {
+        let bindings = bindings();
+        assert_eq!(
+            match_key(&bindings, &KeyCode::named("VolumeMute")),
+            Some(HotkeyAction::MuteToggle)
+        );
+    }
+
+    #[test]
+    fn unbound_key_matches_nothing() {
+        let bindings = bindings();
+        assert_eq!(match_key(&bindings, &KeyCode::named("KeyA")), None);
+    }
+
+    #[test]
+    fn mute_none_never_matches() {
+        let mut bindings = bindings();
+        bindings.mute = None;
+        // Even a key that happens to equal one of the other bindings' values
+        // must not be reported as a mute match when mute is unset.
+        assert_eq!(match_key(&bindings, &KeyCode::named("VolumeMute")), None);
+    }
+}

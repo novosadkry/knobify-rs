@@ -227,3 +227,92 @@ pub fn save(path: &Path, settings: &Settings) -> Result<(), ConfigError> {
     fs::rename(&tmp, path).map_err(write_err)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_serializes_and_parses_back_equal() {
+        let settings = Settings::default();
+        let text = toml::to_string_pretty(&settings).unwrap();
+        let parsed: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(parsed, settings);
+    }
+
+    #[test]
+    fn partial_toml_yields_defaults_elsewhere() {
+        let parsed: Settings = toml::from_str("step = 10\n").unwrap();
+        let expected = Settings {
+            step: 10,
+            ..Settings::default()
+        };
+        assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn sanitized_clamps_step() {
+        let low = Settings {
+            step: 0,
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!(low.step, MIN_STEP);
+
+        let high = Settings {
+            step: 99,
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!(high.step, MAX_STEP);
+    }
+
+    #[test]
+    fn sanitized_clamps_osd_duration() {
+        let low = Settings {
+            osd: OsdSettings {
+                duration_ms: 10,
+                ..OsdSettings::default()
+            },
+            ..Settings::default()
+        }
+        .sanitized();
+        assert_eq!(low.osd.duration_ms, MIN_OSD_DURATION_MS);
+        assert_eq!(MIN_OSD_DURATION_MS, 300);
+    }
+
+    #[test]
+    fn load_missing_path_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.toml");
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded, Settings::default());
+    }
+
+    #[test]
+    fn save_then_load_round_trips_and_cleans_up_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let settings = Settings {
+            step: 12,
+            client_id: "abc123".to_owned(),
+            ..Settings::default()
+        };
+
+        save(&path, &settings).unwrap();
+        assert!(path.exists());
+        assert!(!path.with_extension("toml.tmp").exists());
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded, settings.sanitized());
+    }
+
+    #[test]
+    fn malformed_toml_yields_parse_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "this is not valid toml = = =").unwrap();
+        let err = load(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse { .. }));
+    }
+}

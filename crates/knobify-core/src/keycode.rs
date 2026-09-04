@@ -105,3 +105,75 @@ impl fmt::Display for KeyCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hex_lowercase_and_uppercase_prefix() {
+        assert_eq!("0x82".parse::<KeyCode>().unwrap(), KeyCode::Raw(0x82));
+        assert_eq!("0X82".parse::<KeyCode>().unwrap(), KeyCode::Raw(0x82));
+    }
+
+    #[test]
+    fn parses_named_key() {
+        assert_eq!(
+            "VolumeUp".parse::<KeyCode>().unwrap(),
+            KeyCode::Named("VolumeUp".to_owned())
+        );
+    }
+
+    #[test]
+    fn rejects_empty_string() {
+        assert_eq!("".parse::<KeyCode>(), Err(KeyCodeParseError::Empty));
+    }
+
+    #[test]
+    fn rejects_bad_hex() {
+        assert!(matches!(
+            "0xZZ".parse::<KeyCode>(),
+            Err(KeyCodeParseError::BadHex(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_name_with_space() {
+        assert!(matches!(
+            "Volume Up".parse::<KeyCode>(),
+            Err(KeyCodeParseError::BadName(_))
+        ));
+    }
+
+    #[test]
+    fn to_config_string_round_trips_through_from_str() {
+        for original in [KeyCode::Raw(0x82), KeyCode::named("VolumeUp")] {
+            let text = original.to_config_string();
+            let parsed: KeyCode = text.parse().unwrap();
+            assert_eq!(parsed, original);
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct Wrapper {
+        key: KeyCode,
+    }
+
+    #[test]
+    fn serde_round_trips_inside_a_struct_via_toml() {
+        for key in [KeyCode::Raw(0x82), KeyCode::named("VolumeUp")] {
+            let wrapper = Wrapper { key };
+            let text = toml::to_string(&wrapper).unwrap();
+            let parsed: Wrapper = toml::from_str(&text).unwrap();
+            assert_eq!(parsed, wrapper);
+        }
+    }
+
+    #[test]
+    fn display_formats_human_readable_labels() {
+        assert_eq!(KeyCode::named("VolumeUp").to_string(), "Volume Up");
+        assert_eq!(KeyCode::Raw(0x82).to_string(), "Key 0x82");
+        assert_eq!(KeyCode::named("F13").to_string(), "F13");
+        assert_eq!(KeyCode::named("KeyA").to_string(), "Key A");
+    }
+}
